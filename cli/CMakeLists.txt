@@ -4,7 +4,7 @@ project(debugger-cli)
 
 remove_definitions(-DUNICODE -D_UNICODE)
 
-file(GLOB SOURCES *.cpp *.h)
+file(GLOB SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 
 add_executable(debugger-cli ${SOURCES})
 
@@ -15,7 +15,7 @@ else()
 endif()
 
 set_target_properties(debugger-cli PROPERTIES
-        CXX_STANDARD 17
+        CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON

@@ -38,12 +38,14 @@ namespace BinaryNinjaDebugger {
 		DebuggerState* m_state;
 		std::unordered_map<std::string, DebugRegister> m_registerCache;
 		bool m_dirty;
+		std::recursive_mutex m_registersMutex;
+		std::unordered_map<std::string, DebugRegister> GetCachedRegisters();
 
 	public:
 		DebuggerRegisters(DebuggerState* state);
 		// DebugRegister operator[](std::string name);
-		uint64_t GetRegisterValue(const std::string& name);
-		bool SetRegisterValue(const std::string& name, uint64_t value);
+		intx::uint512 GetRegisterValue(const std::string& name);
+		bool SetRegisterValue(const std::string& name, intx::uint512 value);
 		void MarkDirty();
 		bool IsDirty() const { return m_dirty; }
 		void Update();
@@ -57,6 +59,7 @@ namespace BinaryNinjaDebugger {
 		DebuggerState* m_state;
 		std::vector<DebugModule> m_modules;
 		bool m_dirty;
+		std::recursive_mutex m_modulesMutex;
 
 	public:
 		DebuggerModules(DebuggerState* state);
@@ -102,6 +105,7 @@ namespace BinaryNinjaDebugger {
 		std::vector<DebugThread> m_threads;
 		std::map<uint32_t, std::vector<DebugFrame>> m_frames;
 		bool m_dirty;
+		std::recursive_mutex m_threadsMutex;
 
 	public:
 		DebuggerThreads(DebuggerState* state);
@@ -111,6 +115,7 @@ namespace BinaryNinjaDebugger {
 		bool SetActiveThread(const DebugThread& thread);
 		bool IsDirty() const { return m_dirty; }
 		std::vector<DebugThread> GetAllThreads();
+		std::map<uint32_t, std::vector<DebugFrame>> GetAllFrames();
 		std::vector<DebugFrame> GetFramesOfThread(uint32_t tid);
 		bool SuspendThread(std::uint32_t tid);
 		bool ResumeThread(std::uint32_t tid);
@@ -125,11 +130,18 @@ namespace BinaryNinjaDebugger {
 		FailedToReadStatus
 	};
 
+	enum MemoryByteCacheSource
+	{
+		NoSource,
+		PausedTargetSource,
+		BackingBinaryViewSource
+	};
 
 	struct MemoryBytesCache
 	{
 		DataBuffer value;
 		MemoryByteCacheStatus status;
+		MemoryByteCacheSource source;
 	};
 
 
@@ -137,7 +149,9 @@ namespace BinaryNinjaDebugger {
 	{
 		DebuggerState* m_state;
 		std::map<uint64_t, MemoryBytesCache> m_valueCache;
+		std::map<uint64_t, std::pair<uint64_t, DataBuffer>> m_valueCachePrefilled;
 		std::recursive_mutex m_memoryMutex;
+
 
 	public:
 		DebuggerMemory(DebuggerState* state);
@@ -146,6 +160,8 @@ namespace BinaryNinjaDebugger {
 		DataBuffer ReadBlock(uint64_t block);
 		DataBuffer ReadMemory(uint64_t offset, size_t len);
 		bool WriteMemory(std::uintptr_t address, const DataBuffer& buffer);
+		void PrefillValueCache();
+		void OnRebased();
 	};
 
 

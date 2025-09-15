@@ -20,6 +20,8 @@ limitations under the License.
 #include "debuggerevent.h"
 #include <queue>
 #include <list>
+#include <future>
+#include <functional>
 #include "ffi_global.h"
 #include "refcountobject.h"
 #include "debuggerfileaccessor.h"
@@ -53,11 +55,24 @@ namespace BinaryNinjaDebugger {
 		bool operator!=(const StackVariableNameAndType& other) { return !(*this == other); }
 	};
 
+	struct DebuggerUICallbacks
+	{
+		BNDebuggerUICallbacks* m_callbacks;
+		void* m_context;
+
+		void NotifyRebaseBinaryView(uint64_t base);
+	};
+
 	// This is the controller class of the debugger. It receives the input from the UI/API, and then route them to
 	// the state and UI, etc. Most actions should reach here.
 	class DebuggerController : public DbgRefCountObject, BinaryNinja::BinaryDataNotification
 	{
 		IMPLEMENT_DEBUGGER_API_OBJECT(BNDebuggerController);
+
+		struct PendingEvent {
+			DebuggerEvent event;
+			std::promise<void> done;
+		};
 
 	private:
 		DebugAdapter* m_adapter;
@@ -76,7 +91,7 @@ namespace BinaryNinjaDebugger {
 
 		std::atomic<size_t> m_callbackIndex = 0;
 		std::list<DebuggerEventCallback> m_eventCallbacks;
-		std::recursive_mutex m_callbackMutex;
+		std::mutex m_callbackMutex;
 		std::set<size_t> m_disabledCallbacks;
 
 		// m_adapterMutex is a low-level mutex that protects the adapter access. It cannot be locked recursively.
@@ -141,6 +156,8 @@ namespace BinaryNinjaDebugger {
 		DebugStopReason StepReturnReverseAndWaitInternal();
 		DebugStopReason RunToAndWaitInternal(const std::vector<uint64_t> &remoteAddresses);
 
+		// Whether we can start debugging, e.g., launch/attach/connec to a target
+		bool CanStartDebgging();
 		// Whether we can resume the execution of the target, including stepping.
 		bool CanResumeTarget();
 
@@ -170,6 +187,19 @@ namespace BinaryNinjaDebugger {
 		// bool m_adapterSupportsThreads = false;
 		bool m_adapterSupportsTTD = false;
 
+		std::mutex m_eventsMutex;
+		std::condition_variable m_cv;
+		std::queue<std::shared_ptr<PendingEvent>> m_eventQueue;
+		std::thread::id m_dispatcherThreadId;
+		std::atomic_bool m_shouldExit;
+		std::thread m_debuggerEventThread;
+		void DebuggerMainThread();
+
+		std::unique_ptr<DebuggerUICallbacks> m_uiCallbacks;
+
+		uint64_t m_oldViewBase, m_newViewBase;
+		std::vector<BNAddressRange> m_ranges;
+
 	public:
 		DebuggerController(BinaryViewRef data);
 		static DbgRef<DebuggerController> GetController(BinaryViewRef data);
@@ -194,8 +224,8 @@ namespace BinaryNinjaDebugger {
 		DebugBreakpoint GetAllBreakpoints();
 
 		// registers
-		uint64_t GetRegisterValue(const std::string& name);
-		bool SetRegisterValue(const std::string& name, uint64_t value);
+		intx::uint512 GetRegisterValue(const std::string& name);
+		bool SetRegisterValue(const std::string& name, intx::uint512 value);
 		std::vector<DebugRegister> GetAllRegisters();
 
 		// processes
@@ -250,6 +280,7 @@ namespace BinaryNinjaDebugger {
 		bool Restart();
 		bool ConnectToDebugServer();
 		bool DisconnectDebugServer();
+		bool IsConnectedToDebugServer();
 		// Convenience function, either launch the target process or connect to a remote, depending on the selected
 		// adapter
 		void LaunchOrConnect();
@@ -314,7 +345,7 @@ namespace BinaryNinjaDebugger {
 		bool ActivateDebugAdapter();
 
 		// Dereference an address and check for printable strings, functions, symbols, etc
-		std::string GetAddressInformation(uint64_t address);
+		std::string GetAddressInformation(intx::uint512 value);
 
 		bool IsFirstLaunch();
 		bool IsFirstConnect();
@@ -322,36 +353,39 @@ namespace BinaryNinjaDebugger {
 		bool IsFirstAttach();
 		bool IsTTD();
 
-		void OnRebased(BinaryView* oldView, BinaryView* newView) override {
-			m_data = newView;
-			m_viewStart = newView->GetStart();
-			// UnregisterNotification() is not designed to be called from one of the callbacks, so we cannot call it
-			// here. Also, there is no need to do so -- the oldView is about to be deleted
-			// oldView->UnregisterNotification(this);
-			newView->RegisterNotification(this);
-		}
+		// TTD Memory Analysis Methods
+		std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType = TTDMemoryRead);
+		std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0);
+		TTDPosition GetCurrentTTDPosition();
+		bool SetTTDPosition(const TTDPosition& position);
+
+		void OnRebased(BinaryView* oldView, BinaryView* newView);
 
 		bool RemoveDebuggerMemoryRegion();
 		bool ReAddDebuggerMemoryRegion();
 
 		uint64_t GetViewFileSegmentsStart() { return m_viewStart; }
 
-		bool ComputeExprValueAPI(const LowLevelILInstruction& instr, uint64_t& value);
-		bool ComputeExprValue(const LowLevelILInstruction& instr, uint64_t& value);
-		uint64_t GetValueFromComparison(const BNLowLevelILOperation op, uint64_t left, uint64_t right, size_t size);
+		bool ComputeExprValueAPI(const LowLevelILInstruction& instr, intx::uint512& value);
+		bool ComputeExprValue(const LowLevelILInstruction& instr, intx::uint512& value);
+		intx::uint512 GetValueFromComparison(const BNLowLevelILOperation op, intx::uint512 left, intx::uint512 right, size_t size);
 
-		bool ComputeExprValueAPI(const MediumLevelILInstruction& instr, uint64_t& value);
-		bool ComputeExprValue(const MediumLevelILInstruction& instr, uint64_t& value);
-		uint64_t GetValueFromComparison(const BNMediumLevelILOperation op, uint64_t left, uint64_t right, size_t size);
+		bool ComputeExprValueAPI(const MediumLevelILInstruction& instr, intx::uint512& value);
+		bool ComputeExprValue(const MediumLevelILInstruction& instr, intx::uint512& value);
+		intx::uint512 GetValueFromComparison(const BNMediumLevelILOperation op, intx::uint512 left, intx::uint512 right, size_t size);
 
-		bool ComputeExprValueAPI(const HighLevelILInstruction& instr, uint64_t& value);
-		bool ComputeExprValue(const HighLevelILInstruction& instr, uint64_t& value);
-		uint64_t GetValueFromComparison(const BNHighLevelILOperation op, uint64_t left, uint64_t right, size_t size);
+		bool ComputeExprValueAPI(const HighLevelILInstruction& instr, intx::uint512& value);
+		bool ComputeExprValue(const HighLevelILInstruction& instr, intx::uint512& value);
+		intx::uint512 GetValueFromComparison(const BNHighLevelILOperation op, intx::uint512 left, intx::uint512 right, size_t size);
 
-		bool GetVariableValueAPI(const Variable& var, uint64_t address, size_t size, uint64_t& value);
-		bool GetVariableValue(const Variable& var, uint64_t address, size_t size, uint64_t& value);
+		bool GetVariableValueAPI(const Variable& var, uint64_t address, size_t size, intx::uint512& value);
+		bool GetVariableValue(const Variable& var, uint64_t address, size_t size, intx::uint512& value);
 
 		Ref<Settings> GetAdapterSettings();
 		bool CreateDebugAdapter();
+
+		void SetDebuggerUICallbacks(BNDebuggerUICallbacks* cb, void* ctxt);
+
+		bool FunctionExistsInOldView(uint64_t address);
 	};
 };  // namespace BinaryNinjaDebugger

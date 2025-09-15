@@ -57,7 +57,7 @@ DebugAdapterScriptingInstance::~DebugAdapterScriptingInstance()
 
 void DebugAdapterScriptingInstance::SetCurrentBinaryView(BinaryNinja::BinaryView* view)
 {
-	if (m_data.operator!=(view))
+	if (m_data != view)
 	{
 		m_data = view;
 		if (m_data)
@@ -68,6 +68,7 @@ void DebugAdapterScriptingInstance::SetCurrentBinaryView(BinaryNinja::BinaryView
 			m_controller = DebuggerController::GetController(view);
 			if (m_controller)
 			{
+				// A scripting instance is NOT a Qt widget, so it is fine to not do things on the main thread
 				m_debuggerEventCallback = m_controller->RegisterEventCallback(
 					[&](const DebuggerEvent& event) {
 						if (event.type == BackendMessageEventType)

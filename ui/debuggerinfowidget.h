@@ -47,13 +47,13 @@ enum ColumnHeaders
 struct DebuggerInfoEntry
 {
 	std::vector<InstructionTextToken> tokens;
-	uint64_t value;
+	intx::uint512 value;
 	std::string hints;
 	size_t instrIndex;
 	size_t operandIndex;
 	uint64_t address;
 
-	DebuggerInfoEntry(const std::vector<InstructionTextToken>& t, uint64_t v, const std::string& h, size_t i, size_t o,
+	DebuggerInfoEntry(const std::vector<InstructionTextToken>& t, intx::uint512 v, const std::string& h, size_t i, size_t o,
 					  uint64_t a): tokens(t), value(v), hints(h), instrIndex(i), operandIndex(o), address(a)
 	{}
 };
@@ -173,5 +173,6 @@ public:
 	SidebarWidget* createWidget(ViewFrame* frame, BinaryViewRef data) override;
 	SidebarWidgetLocation defaultLocation() const override { return SidebarWidgetLocation::RightBottom; }
 	SidebarContextSensitivity contextSensitivity() const override { return PerViewTypeSidebarContext; }
-//	bool hideIfNoContent() const override { return true; }
+	SidebarIconVisibility defaultIconVisibility() const override { return HideSidebarIconIfNoContent; }
+	SidebarContentClassifier* contentClassifier(ViewFrame*, BinaryViewRef) override;
 };

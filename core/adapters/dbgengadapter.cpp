@@ -25,6 +25,9 @@ limitations under the License.
 #include <highlevelilinstruction.h>
 #include <memory>
 #include <filesystem>
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 #include "dbgengadapter.h"
 #include "../../cli/log.h"
 #include "../debuggerevent.h"
@@ -207,17 +210,92 @@ std::string DbgEngAdapter::GenerateRandomPipeName()
 
 bool DbgEngAdapter::LaunchDbgSrv(const std::string& commandLine)
 {
-	STARTUPINFOA si;
-	PROCESS_INFORMATION pi;
-	memset(&si, 0, sizeof(si));
-	si.cb = sizeof(si);
-	memset(&pi, 0, sizeof(pi));
-	if (!CreateProcessA(NULL, (LPSTR)commandLine.c_str(), NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi))
+	// Check if we should run as administrator
+	BNSettingsScope scope = SettingsResourceScope;
+	auto data = GetData();
+	auto adapterSettings = GetAdapterSettings();
+	bool runAsAdmin = adapterSettings->Get<bool>("common.runAsAdministrator", data, &scope);
+
+	if (runAsAdmin)
 	{
-		return false;
+		// Parse command line to extract executable path and arguments
+		// Command line format: "path\to\dbgsrv.exe" -t arguments
+		std::string exePath;
+		std::string args;
+		
+		if (commandLine.size() > 0 && commandLine[0] == '"')
+		{
+			// Find the closing quote
+			size_t endQuote = commandLine.find('"', 1);
+			if (endQuote != std::string::npos)
+			{
+				exePath = commandLine.substr(1, endQuote - 1);
+				if (endQuote + 1 < commandLine.size())
+				{
+					// Skip the closing quote and any leading space
+					size_t argsStart = endQuote + 1;
+					if (argsStart < commandLine.size() && commandLine[argsStart] == ' ')
+						argsStart++;
+					if (argsStart < commandLine.size())
+						args = commandLine.substr(argsStart);
+				}
+			}
+		}
+		else
+		{
+			// No quotes, split on first space
+			size_t spacePos = commandLine.find(' ');
+			if (spacePos != std::string::npos)
+			{
+				exePath = commandLine.substr(0, spacePos);
+				args = commandLine.substr(spacePos + 1);
+			}
+			else
+			{
+				exePath = commandLine;
+			}
+		}
+
+		if (exePath.empty())
+		{
+			LogWarn("Failed to parse executable path from command line: %s", commandLine.c_str());
+			return false;
+		}
+
+		// Use ShellExecuteEx with "runas" verb to launch with elevated privileges
+		SHELLEXECUTEINFOA sei = { 0 };
+		sei.cbSize = sizeof(sei);
+		sei.fMask = 0;  // No special flags needed
+		sei.lpVerb = "runas";
+		sei.lpFile = exePath.c_str();
+		sei.lpParameters = args.empty() ? NULL : args.c_str();
+		sei.nShow = SW_HIDE;
+
+		if (!ShellExecuteExA(&sei))
+		{
+			DWORD error = GetLastError();
+			LogWarn("Failed to launch dbgsrv.exe with administrator privileges. Error: %lu", error);
+			return false;
+		}
+
+		m_dbgSrvLaunchedByAdapter = true;
+		return true;
 	}
-	m_dbgSrvLaunchedByAdapter = true;
-	return true;
+	else
+	{
+		// Use original CreateProcess method
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		memset(&si, 0, sizeof(si));
+		si.cb = sizeof(si);
+		memset(&pi, 0, sizeof(pi));
+		if (!CreateProcessA(NULL, (LPSTR)commandLine.c_str(), NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi))
+		{
+			return false;
+		}
+		m_dbgSrvLaunchedByAdapter = true;
+		return true;
+	}
 }
 
 bool DbgEngAdapter::ConnectToDebugServerInternal(const std::string& connectionString)
@@ -273,8 +351,11 @@ bool DbgEngAdapter::ConnectToDebugServerInternal(const std::string& connectionSt
 
 bool DbgEngAdapter::Start()
 {
-	if (this->m_debugActive)
-		this->Reset();
+	if (this->m_dbgengInitialized)
+	{
+		// Debugger is already started, return success
+		return true;
+	}
 
 	if (!m_connectedToDebugServer)
 	{
@@ -320,16 +401,17 @@ bool DbgEngAdapter::Start()
 		return false;
 	}
 
-	this->m_debugActive = true;
+	this->m_dbgengInitialized = true;
 	return true;
 }
 
 
 void DbgEngAdapter::Reset()
 {
+	std::unique_lock lock(m_engineLoopMutex);
 	m_aboutToBeKilled = false;
 
-	if (!this->m_debugActive)
+	if (!this->m_dbgengInitialized)
 		return;
 
 	// Free up the resources if the dbgsrv is launched by the adapter. Otherwise, the dbgsrv is launched outside BN,
@@ -354,7 +436,8 @@ void DbgEngAdapter::Reset()
 		SAFE_RELEASE(this->m_debugClient);
 	}
 
-	this->m_debugActive = false;
+	this->m_dbgengInitialized = false;
+	this->m_activelyDebugging = false;
 }
 
 
@@ -407,6 +490,19 @@ bool DbgEngAdapter::ExecuteWithArgs(const std::string& path, const std::string& 
 bool DbgEngAdapter::ExecuteWithArgsInternal(const std::string& path, const std::string& args,
 	const std::string& workingDir, const LaunchConfigurations& configs)
 {
+	std::unique_lock lock(m_engineLoopMutex);
+
+	// If we're actively debugging, fail instead of resetting to prevent crashes
+	if (this->m_activelyDebugging)
+	{
+		DebuggerEvent event;
+		event.type = LaunchFailureEventType;
+		event.data.errorData.error = fmt::format("Cannot launch while actively debugging another target");
+		event.data.errorData.shortError = fmt::format("Already debugging");
+		PostDebuggerEvent(event);
+		return false;
+	}
+
 	m_aboutToBeKilled = false;
 
 	BNSettingsScope scope = SettingsResourceScope;
@@ -421,11 +517,6 @@ bool DbgEngAdapter::ExecuteWithArgsInternal(const std::string& path, const std::
 	auto inputFile = adapterSettings->Get<std::string>("common.inputFile", data, &scope);
 	scope = SettingsResourceScope;
 	auto envVariables = adapterSettings->Get<vector<string>>("launch.environmentVariables", data, &scope);
-
-	if (this->m_debugActive)
-	{
-		this->Reset();
-	}
 
 	if (!Start())
 	{
@@ -529,12 +620,23 @@ bool DbgEngAdapter::ExecuteWithArgsInternal(const std::string& path, const std::
 		}
 	}
 
+	// Mark that we're now actively debugging a target
+	this->m_activelyDebugging = true;
+
 	return true;
 }
 
 
 void DbgEngAdapter::EngineLoop()
 {
+	// When the user rapidly restarts the target, there is a race condition that could lead to a crash:
+	// 1) The target is killed, and the EngineLoop is about to exit, but not yet
+	// 2) The restart code tries to restart the target, which calls ExecuteWithArgsInternal() -> Reset() -> set
+	//    m_debugControl to nullptr
+	// 3) Crash in EngineLoop
+	// This lock prevents Reset() from proceeding until the EngineLoop() actually exits
+	std::unique_lock lock(m_engineLoopMutex);
+
 	auto settings = Settings::Instance();
 	bool outputStateOnStop = settings->Get<bool>("debugger.dbgEngOutputStateOnStop");
 
@@ -625,15 +727,25 @@ void DbgEngAdapter::EngineLoop()
 
 bool DbgEngAdapter::AttachInternal(std::uint32_t pid)
 {
+	std::unique_lock lock(m_engineLoopMutex);
+
+	// If we're actively debugging, fail instead of resetting to prevent crashes
+	if (this->m_activelyDebugging)
+	{
+		DebuggerEvent event;
+		event.type = LaunchFailureEventType;
+		event.data.errorData.error = fmt::format("Cannot attach while actively debugging another target");
+		event.data.errorData.shortError = fmt::format("Already debugging");
+		PostDebuggerEvent(event);
+		return false;
+	}
+
 	m_aboutToBeKilled = false;
 
 	BNSettingsScope scope = SettingsResourceScope;
 	auto data = GetData();
 	auto adapterSettings = GetAdapterSettings();
 	auto attachPID = adapterSettings->Get<uint64_t>("attach.pid", data, &scope);
-
-	if (this->m_debugActive)
-		this->Reset();
 
 	this->Start();
 
@@ -669,6 +781,9 @@ bool DbgEngAdapter::AttachInternal(std::uint32_t pid)
 	}
 
 	ApplyBreakpoints();
+
+	// Mark that we're now actively debugging a target
+	this->m_activelyDebugging = true;
 
 	return true;
 }
@@ -758,7 +873,7 @@ std::vector<DebugProcess> DbgEngAdapter::GetProcessList()
 {
 	// we need to start dbgserver in order to get process list
 	
-	if (!m_debugActive)
+	if (!m_dbgengInitialized)
 	{
 		if (!Start())
 			return {};
@@ -927,7 +1042,7 @@ DebugBreakpoint DbgEngAdapter::AddBreakpoint(const ModuleNameAndOffset& address,
 {
 	// If the backend has been created, we add the breakpoints directly. Otherwise, keep track of the breakpoints,
 	// and add them when we launch/attach the target.
-	if (m_debugActive)
+	if (m_dbgengInitialized)
 	{
 		BNSettingsScope scope = SettingsResourceScope;
 		auto data = GetData();
@@ -990,7 +1105,7 @@ bool DbgEngAdapter::RemoveBreakpoint(const ModuleNameAndOffset& breakpoint)
 {
 	// If the backend has been created, we remove the breakpoints directly. Otherwise, remove it from the list of
 	// pending breakpoints.
-	if (m_debugActive)
+	if (m_dbgengInitialized)
 	{
 		// TODO. This is not used by the controller right now.
 	}
@@ -1076,10 +1191,13 @@ DebugRegister DbgEngAdapter::ReadRegister(const std::string& reg)
 		break;
 	}
 
-	return DebugRegister {reg, debug_value.I64, width, reg_index};
+	uint8_t buffer[64] = {0};
+	memcpy(buffer, debug_value.RawBytes, width / 8);
+	auto value = intx::le::load<intx::uint512>(buffer);
+	return DebugRegister {reg, value, width, reg_index};
 }
 
-bool DbgEngAdapter::WriteRegister(const std::string& reg, std::uintptr_t value)
+bool DbgEngAdapter::WriteRegister(const std::string& reg, intx::uint512 value)
 {
 	unsigned long reg_index {};
 
@@ -1087,8 +1205,11 @@ bool DbgEngAdapter::WriteRegister(const std::string& reg, std::uintptr_t value)
 		return false;
 
 	DEBUG_VALUE debug_value {};
-	debug_value.I64 = value;
-	debug_value.Type = DEBUG_VALUE_INT64;
+	uint8_t buffer[64] = {0};
+	intx::le::store(buffer, value);
+	// The DEBUG_VALUE can only store 24 bytes of the register value
+	memcpy(debug_value.RawBytes, buffer, 24);
+	debug_value.Type = DEBUG_VALUE_VECTOR128;
 
 	if (this->m_debugRegisters->SetValue(reg_index, &debug_value) != S_OK)
 		return false;
@@ -1151,7 +1272,7 @@ std::vector<DebugModule> DbgEngAdapter::GetModuleList()
 	auto adapterSettings = GetAdapterSettings();
 	auto inputFile = adapterSettings->Get<std::string>("common.inputFile", data, &scope);
 
-	const auto total_modules = loaded_module_count + unloaded_module_count;
+	const auto total_modules = loaded_module_count;
 	auto module_parameters = std::make_unique<DEBUG_MODULE_PARAMETERS[]>(total_modules);
 	if (this->m_debugSymbols->GetModuleParameters(total_modules, nullptr, 0, module_parameters.get()) != S_OK)
 		return {};
@@ -1183,7 +1304,7 @@ std::vector<DebugModule> DbgEngAdapter::GetModuleList()
 
 bool DbgEngAdapter::BreakInto()
 {
-	if (ExecStatus() == DEBUG_STATUS_BREAK)
+	if (ExecStatus() == DEBUG_STATUS_BREAK || ExecStatus() == DEBUG_STATUS_NO_DEBUGGEE)
 		return false;
 
 	m_lastOperationIsStepInto = false;
@@ -1807,6 +1928,15 @@ Ref<Settings> LocalDbgEngAdapterType::RegisterAdapterSettings()
 			"minValue" : 0,
 			"maxValue" : 4294967295,
 			"description" : "PID of the process to attach to",
+			"readOnly" : false
+			})");
+
+	settings->RegisterSetting("common.runAsAdministrator",
+		R"({
+			"title" : "Run as Administrator",
+			"type" : "boolean",
+			"default" : false,
+			"description" : "Launch the debug server (dbgsrv.exe) with administrator privileges. Required when debugging processes that run with elevated privileges.",
 			"readOnly" : false
 			})");
 

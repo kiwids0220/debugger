@@ -108,6 +108,11 @@ std::unordered_map<std::string, std::uint64_t> RspConnector::PacketToUnorderedMa
 		if (key_value.size() == 2)
 		{
 			value = RspConnector::DecodeRLE(RspData(key_value[1])).AsString();
+			// This is hack for registers wider than 8 bytes. We could parse it here like how we handle wide registers
+			// in ReadAllRegisters(), but since we do not really use the returned information anywhere, it is fine to
+			// just truncate the string
+			if (value.length() > 16)
+				value = value.substr(0, 16);
 
 			if (key == "thread") {
 				if (value[0] == 'p' && value.find('.') != std::string::npos) {
@@ -149,6 +154,8 @@ void RspConnector::DisableAcks()
 
 char RspConnector::ExpectAck()
 {
+    std::unique_lock lock(m_socketLock);
+
     if ( !this->m_acksEnabled )
         return {};
 
@@ -164,8 +171,10 @@ char RspConnector::ExpectAck()
     return buffer;
 }
 
-void RspConnector::SendAck() const
+void RspConnector::SendAck()
 {
+    std::unique_lock lock(m_socketLock);
+
     if ( !this->m_acksEnabled )
         return;
 
@@ -203,22 +212,29 @@ void RspConnector::NegotiateCapabilities(const std::vector <std::string>& capabi
         this->m_acksEnabled = false;
 }
 
-void RspConnector::SendRaw(const RspData& data) const
+void RspConnector::SendRaw(const RspData& data)
 {
     this->m_socket->Send((char*)data.m_data.GetData(), static_cast<std::int32_t>( data.m_data.GetLength() ));
 }
 
-void RspConnector::SendPayload(const RspData& data) const
+void RspConnector::SendPayload(const RspData& data)
 {
+    std::unique_lock lock(m_socketLock);
+
     const auto checksum = std::accumulate(data.begin(), data.end(), 0) % 256;
     auto packet = "$" + data.AsString() + "#" + fmt::format("{:02x}", checksum);
 
     this->SendRaw(RspData(packet));
 }
 
-RspData RspConnector::ReceiveRspData() const
+RspData RspConnector::ReceiveRspData()
 {
+    std::unique_lock lock(m_socketLock);
+
     std::vector<char> buffer{};
+    auto startTime = std::chrono::steady_clock::now();
+    // TODO: We might wish to make this timeout configurable, but for now waiting 10 seconds I think is good enough
+    const std::chrono::milliseconds timeoutDuration(10000);
 
     while (true)
     {
@@ -230,6 +246,14 @@ RspData RspConnector::ReceiveRspData() const
 #endif
         if (n <= 0)
         {
+            // Check if timeout has been exceeded
+            auto elapsedTime = std::chrono::steady_clock::now() - startTime;
+            if (elapsedTime > timeoutDuration)
+            {
+                LogWarn("ReceiveRspData timeout: failed to receive data within the timeout period");
+                return {}; // Return an empty RspData object
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -261,7 +285,10 @@ RspData RspConnector::ReceiveRspData() const
     }
 
     if ((buffer.size() < 1) || (buffer[0] != '$'))
-        throw std::runtime_error("incorrect response, expected $");
+    {
+        LogWarn("ReceiveRspData: incorrect response, expected $");
+        return {}; // Return an empty RspData object
+    }
 
     // Swallow the '$' char
     buffer.erase(buffer.begin(), buffer.begin() + 1);
@@ -278,7 +305,7 @@ RspData RspConnector::ReceiveRspData() const
 RspData RspConnector::TransmitAndReceive(const RspData& data, const std::string& expect,
 										 std::function<void(const RspData& data)> asyncPacketHandler)
 {
-	std::unique_lock<std::recursive_mutex> lock(m_socketLock);
+	std::unique_lock lock(m_socketLock);
 
     this->SendPayload(data);
 
@@ -338,6 +365,8 @@ RspData RspConnector::TransmitAndReceive(const RspData& data, const std::string&
 
 int32_t RspConnector::HostFileIO(const RspData& data, RspData& output, int32_t& error)
 {
+    std::unique_lock lock(m_socketLock);
+
     this->SendPayload(data);
 
     RspData reply{};

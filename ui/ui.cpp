@@ -35,12 +35,15 @@ limitations under the License.
 #include <filesystem>
 #include <QMessageBox>
 #include "debugadapterscriptingprovider.h"
-#include "targetscriptingprovier.h"
+#include "targetscriptingprovider.h"
 #include "progresstask.h"
 #include "attachprocess.h"
 #include "progresstask.h"
 #include "debuggerinfowidget.h"
+#include "ttdmemorywidget.h"
+#include "ttdcallswidget.h"
 #include "freeversion.h"
+#include <QTimer>
 
 #ifdef WIN32
 	#include "ttdrecord.h"
@@ -188,6 +191,100 @@ static void MakeCodeHelper(BinaryView* view, BNAddressRange selection)
 	view->UpdateAnalysis();
 }
 
+void GlobalDebuggerUI::GetAddressRange(const UIActionContext& ctxt, uint64_t& startAddr, uint64_t& endAddr)
+{
+	if (ctxt.view && ctxt.view->getSelectionOffsets().start != ctxt.view->getSelectionOffsets().end)
+	{
+		// Use selection range
+		auto selection = ctxt.view->getSelectionOffsets();
+		startAddr = selection.start;
+		endAddr = selection.end;
+	}
+	else
+	{
+		// Use current address, default to 1 byte
+		startAddr = ctxt.address;
+		endAddr = ctxt.address + 1;
+	}
+}
+
+void GlobalDebuggerUI::QueryTTDMemoryAccess(const UIActionContext& ctxt, uint64_t startAddr, uint64_t endAddr, BNDebuggerTTDMemoryAccessType accessType)
+{
+	// Focus the TTD Memory sidebar widget
+	if (!ctxt.context)
+		return;
+
+	auto sidebar = ctxt.context->sidebar();
+	if (!sidebar)
+		return;
+
+	// Get the current view frame
+	ViewFrame* frame = ctxt.context->getCurrentViewFrame();
+	if (!frame)
+		return;
+
+	auto controller = DebuggerController::GetController(ctxt.binaryView);
+	if (!controller)
+		return;
+
+	// Convert BNDebuggerTTDMemoryAccessType to TTDMemoryAccessType
+	TTDMemoryAccessType accessTypeEnum = static_cast<TTDMemoryAccessType>(accessType);
+	
+	// Set pending query first
+	TTDMemoryWidgetType::SetPendingQuery(frame, ctxt.binaryView, startAddr, endAddr, accessTypeEnum);
+	
+	// Activate the sidebar widget
+	sidebar->activate("TTD Memory");
+	
+	// Try to find the widget that was just created/activated and apply the query immediately
+	// We'll give it a moment to be created if needed
+	QTimer::singleShot(100, [sidebar, ctxt, startAddr, endAddr, accessTypeEnum]() {
+		// Try to find the active TTD Memory widget
+		auto* sidebarWidget = sidebar->widget("TTD Memory");
+		if (auto* ttdWidget = qobject_cast<TTDMemorySidebarWidget*>(sidebarWidget))
+		{
+			ttdWidget->setParametersAndQueryInNewTab(startAddr, endAddr, accessTypeEnum);
+		}
+	});
+}
+
+
+void GlobalDebuggerUI::QueryTTDCalls(const UIActionContext& ctxt, const std::string& symbols, uint64_t startReturnAddr, uint64_t endReturnAddr)
+{
+	// Focus the TTD Calls sidebar widget
+	if (!ctxt.context)
+		return;
+
+	ViewFrame* frame = ctxt.context->getCurrentViewFrame();
+	if (!frame)
+		return;
+
+	auto sidebar = frame->getSidebar();
+	if (!sidebar)
+		return;
+
+	auto controller = DebuggerController::GetController(ctxt.binaryView);
+	if (!controller)
+		return;
+
+	// Set pending query first
+	TTDCallsWidgetType::SetPendingQuery(frame, ctxt.binaryView, symbols, startReturnAddr, endReturnAddr);
+	
+	// Activate the sidebar widget
+	sidebar->activate("TTD Calls");
+	
+	// Try to find the widget that was just created/activated and apply the query immediately
+	// We'll give it a moment to be created if needed
+	QTimer::singleShot(100, [sidebar, ctxt, symbols, startReturnAddr, endReturnAddr]() {
+		// Try to find the active TTD Calls widget
+		auto* sidebarWidget = sidebar->widget("TTD Calls");
+		if (auto* ttdWidget = qobject_cast<TTDCallsSidebarWidget*>(sidebarWidget))
+		{
+			ttdWidget->setParametersAndQueryInNewTab(symbols, startReturnAddr, endReturnAddr);
+		}
+	});
+}
+
 
 void GlobalDebuggerUI::SetupMenu(UIContext* context)
 {
@@ -246,6 +343,18 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 			return false;
 
 		return controller->IsConnected() && (!controller->IsRunning()) && controller->IsTTD();
+	};
+
+	auto connectedToTTD = [=](const UIActionContext& ctxt) {
+		if (!ctxt.binaryView)
+			return false;
+		if (!DebuggerController::ControllerExists(ctxt.binaryView))
+			return false;
+		auto controller = DebuggerController::GetController(ctxt.binaryView);
+		if (!controller)
+			return false;
+
+		return controller->IsConnected() && controller->IsTTD();
 	};
 
 	auto connectedAndRunning = [=](const UIActionContext& ctxt) {
@@ -411,7 +520,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Resume", QKeySequence(Qt::Key_F9));
 	context->globalActions()->bindAction("Resume",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -427,7 +536,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Go Backwards", QKeySequence(Qt::ShiftModifier | Qt::Key_F9));
 	context->globalActions()->bindAction("Go Backwards",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -442,7 +551,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Into", QKeySequence(Qt::Key_F7));
 	context->globalActions()->bindAction("Step Into",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -461,7 +570,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Into Backwards", QKeySequence(Qt::ShiftModifier | Qt::Key_F7));
 	context->globalActions()->bindAction("Step Into Backwards",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -479,7 +588,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Over", QKeySequence(Qt::Key_F8));
 	context->globalActions()->bindAction("Step Over",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -498,7 +607,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Over Backwards", QKeySequence(Qt::ShiftModifier | Qt::Key_F8));
 	context->globalActions()->bindAction("Step Over Backwards",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -516,7 +625,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Return", QKeySequence(Qt::ControlModifier | Qt::Key_F9));
 	context->globalActions()->bindAction("Step Return",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -532,7 +641,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Step Return Backwards", QKeySequence( Qt::ControlModifier | Qt::ShiftModifier | Qt::Key_F9 ));
 	context->globalActions()->bindAction("Step Return Backwards",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -547,7 +656,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 	UIAction::registerAction("Run To Here", QKeySequence(Qt::Key_F4));
 	context->globalActions()->bindAction("Run To Here",
 		UIAction(
-			[=](const UIActionContext& ctxt) {
+			[this](const UIActionContext& ctxt) {
 				if (!ctxt.binaryView)
 					return;
 				auto controller = DebuggerController::GetController(ctxt.binaryView);
@@ -833,12 +942,8 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				if (!controller)
 					return;
 
-				uint64_t address = 0;
-				if (!ViewFrame::getAddressFromInput(ctxt.context->getCurrentViewFrame(), ctxt.binaryView, address,
-						ctxt.address, "Override IP", "New instruction pointer value:", true))
-					return;
-
-				if (!controller->SetIP(address))
+				uint64_t address = ctxt.address;
+				if (!controller->SetIP(ctxt.address))
 					LogWarn("Failed to override IP to 0x%" PRIx64, address);
 			},
 			connectedAndStopped));
@@ -897,6 +1002,151 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 		UIAction(
 			[=](const UIActionContext& ctxt) { installTTD(ctxt); }));
 	debuggerMenu->addAction("Install WinDbg/TTD", "TTD");
+
+	// TTD Memory Access context menu items
+	UIAction::registerAction("TTD Memory Access\\Read");
+	context->globalActions()->bindAction("TTD Memory Access\\Read",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsConnected())
+					return;
+				
+				uint64_t startAddr, endAddr;
+				GetAddressRange(ctxt, startAddr, endAddr);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryRead);
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Memory Access\\Read", "TTD");
+
+	UIAction::registerAction("TTD Memory Access\\Write");
+	context->globalActions()->bindAction("TTD Memory Access\\Write",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsConnected())
+					return;
+				
+				uint64_t startAddr, endAddr;
+				GetAddressRange(ctxt, startAddr, endAddr);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryWrite);
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Memory Access\\Write", "TTD");
+
+	UIAction::registerAction("TTD Memory Access\\Read/Write");
+	context->globalActions()->bindAction("TTD Memory Access\\Read/Write",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsConnected())
+					return;
+				
+				uint64_t startAddr, endAddr;
+				GetAddressRange(ctxt, startAddr, endAddr);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(BNDebuggerTTDMemoryRead | BNDebuggerTTDMemoryWrite));
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Memory Access\\Read/Write", "TTD");
+
+	UIAction::registerAction("TTD Memory Access\\Execute");
+	context->globalActions()->bindAction("TTD Memory Access\\Execute",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsConnected())
+					return;
+				
+				uint64_t startAddr, endAddr;
+				GetAddressRange(ctxt, startAddr, endAddr);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryExecute);
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Memory Access\\Execute", "TTD");
+
+	UIAction::registerAction("TTD Memory Access\\Read/Write/Execute");
+	context->globalActions()->bindAction("TTD Memory Access\\Read/Write/Execute",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsConnected())
+					return;
+				
+				uint64_t startAddr, endAddr;
+				GetAddressRange(ctxt, startAddr, endAddr);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(BNDebuggerTTDMemoryRead | BNDebuggerTTDMemoryWrite | BNDebuggerTTDMemoryExecute));
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Memory Access\\Read/Write/Execute", "TTD");
+
+	// TTD Calls menu actions
+	UIAction::registerAction("TTD Calls\\All Calls");
+	context->globalActions()->bindAction("TTD Calls\\All Calls", UIAction([=](const UIActionContext& ctxt) {
+			auto controller = DebuggerController::GetController(ctxt.binaryView);
+			if (!controller || !controller->IsConnected())
+				return;
+			
+			// Query all calls with wildcard
+			QueryTTDCalls(ctxt, "*!*");
+		},
+		connectedToTTD));
+	debuggerMenu->addAction("TTD Calls\\All Calls", "TTD");
+
+	UIAction::registerAction("TTD Calls\\Kernel32 Calls");
+	context->globalActions()->bindAction("TTD Calls\\Kernel32 Calls", UIAction([=](const UIActionContext& ctxt) {
+			auto controller = DebuggerController::GetController(ctxt.binaryView);
+			if (!controller || !controller->IsConnected())
+				return;
+			
+			// Query kernel32 calls
+			QueryTTDCalls(ctxt, "kernel32!*");
+		},
+		connectedToTTD));
+	debuggerMenu->addAction("TTD Calls\\Kernel32 Calls", "TTD");
+
+	UIAction::registerAction("TTD Calls\\Ntdll Calls");
+	context->globalActions()->bindAction("TTD Calls\\Ntdll Calls", UIAction([=](const UIActionContext& ctxt) {
+			auto controller = DebuggerController::GetController(ctxt.binaryView);
+			if (!controller || !controller->IsConnected())
+				return;
+			
+			// Query ntdll calls
+			QueryTTDCalls(ctxt, "ntdll!*");
+		},
+		connectedToTTD));
+	debuggerMenu->addAction("TTD Calls\\Ntdll Calls", "TTD");
+
+	// TTD Calls context menu action for functions
+	UIAction::registerAction("TTD Calls\\Query Function");
+	context->globalActions()->bindAction("TTD Calls\\Query Function", UIAction([=](const UIActionContext& ctxt) {
+			auto controller = DebuggerController::GetController(ctxt.binaryView);
+			if (!controller || !controller->IsConnected())
+				return;
+			
+			// Get function name from context
+			if (ctxt.function)
+			{
+				auto funcName = ctxt.function->GetSymbol()->GetFullName();
+				QueryTTDCalls(ctxt, funcName);
+			}
+		},
+		connectedToTTD));
+	debuggerMenu->addAction("TTD Calls\\Query Function", "TTD");
 #endif
 }
 
@@ -945,12 +1195,6 @@ DebuggerUI::DebuggerUI(UIContext* context, DebuggerControllerRef controller) :
 
 	m_eventCallback = m_controller->RegisterEventCallback(
 		[this](const DebuggerEvent& event) {
-			if ((event.type == LaunchEventType) || (event.type == AttachEventType) || (event.type == ConnectEventType))
-			{
-				auto* globalUI = GlobalDebuggerUI::GetForContext(m_context);
-				if (globalUI)
-					globalUI->SetDisplayingGlobalAreaWidgets(true);
-			}
 			emit debuggerEvent(event);
 		},
 		"UI");
@@ -966,12 +1210,38 @@ DebuggerUI::DebuggerUI(UIContext* context, DebuggerControllerRef controller) :
 		event.data.relativeAddress.offset = bp.offset;
 		updateUI(event);
 	}
+
+	m_uiCallbacks = new DebuggerUICallbacks;
+	m_uiCallbacks->rebaseBinaryViewImpl = [&](uint64_t address)
+	{
+		checkRebaseBinaryView(address);
+	};
+	m_controller->SetDebuggerUICallbacks(m_uiCallbacks);
 }
 
 
 DebuggerUI::~DebuggerUI()
 {
+	if (m_uiCallbacks)
+	{
+		delete m_uiCallbacks;
+		m_uiCallbacks = nullptr;
+	}
 	m_controller->RemoveEventCallback(m_eventCallback);
+}
+
+
+static void DebuggerUIRebaseCallback(void* ctxt, uint64_t address)
+{
+	DebuggerUICallbacks* object = (DebuggerUICallbacks* )ctxt;
+	if (object)
+		object->rebaseBinaryViewImpl(address);
+}
+
+
+DebuggerUICallbacks::DebuggerUICallbacks()
+{
+	m_callbacks.rebaseBinaryView = DebuggerUIRebaseCallback;
 }
 
 
@@ -1004,20 +1274,6 @@ void GlobalDebuggerUI::CreateGlobalAreaWidgets(UIContext* context)
 		if (!sidebar->hasWidgetWithTitle("Console", "Target"))
 			context->contentActionHandler()->executeAction("Create Target Console");
 	}
-
-	auto widget = sidebar->widget("Stack Trace");
-	if (!widget)
-	{
-		auto* globalThreadFramesContainer = new GlobalThreadFramesContainer("Stack Trace");
-		sidebar->addWidget("Stack Trace", globalThreadFramesContainer);
-	}
-
-	widget = sidebar->widget("Debugger Modules");
-	if (!widget)
-	{
-		auto* globalDebugModulesContainer = new GlobalDebugModulesContainer("Debugger Modules");
-		sidebar->addWidget("Debugger Modules", globalDebugModulesContainer);
-	}
 }
 
 
@@ -1027,15 +1283,7 @@ void GlobalDebuggerUI::CloseGlobalAreaWidgets(UIContext* context)
 	if (!sidebar)
 		return;
 
-	auto widget = sidebar->widget("Stack Trace");
-	if (widget)
-		sidebar->removeWidget("Stack Trace", widget);
-
-	widget = sidebar->widget("Debugger Modules");
-	if (widget)
-		sidebar->removeWidget("Debugger Modules", widget);
-
-	widget = sidebar->widgetWithTitle("Console", "Debugger");
+	auto widget = sidebar->widgetWithTitle("Console", "Debugger");
 	if (widget)
 		sidebar->removeWidget("Console", widget);
 
@@ -1118,7 +1366,7 @@ void DebuggerUI::navigateToCurrentIP()
 		return;
 
 	auto functions = liveView->GetAnalysisFunctionsContainingAddress(address);
-	if (functions.empty())
+	if (functions.empty() && !m_controller->FunctionExistsInOldView(address))
 	{
 		auto data = m_controller->GetData();
 		auto id = data->BeginUndoActions();
@@ -1168,8 +1416,85 @@ void DebuggerUI::navigateToMappedAddress()
 }
 
 
+void DebuggerUI::checkRebaseBinaryView(uint64_t remoteBase)
+{
+	Ref<BinaryView> data = m_controller->GetData();
+	FileMetadataRef fileMetadata = data->GetFile();
+	ViewFrame* frame = m_context->getCurrentViewFrame();
+
+	// Halt analysis when replacing a BinaryView in the UI. If the view is replaced and the tab or
+	// application closes, then the old view may continue analysis without the updated UI having a
+	// reference to properly terminate it before UI destruction.
+	data->AbortAnalysis();
+	data->UpdateAnalysisAndWait();
+
+	ExecuteOnMainThreadAndWait([&]()
+	{
+		m_controller->RemoveDebuggerMemoryRegion();
+		bool result = false;
+		QString text = QString("Rebasing the input view...");
+		ProgressTask* task =
+			new ProgressTask(frame, "Rebase", text, "Cancel", [&](ProgressFunction progress) {
+				// If analysis hold during debugging is active, we must first turn it off, rebase, wait for the
+				// analysis to complete, and then set the analysis hold back on. This is because during rebasing,
+				// all the advanced analysis data is discarded has to be regenerated. If we still holds the
+				// analysis, these function will become un-analyzed and not show up in the linear view
+				auto shouldHoldAnalysis = Settings::Instance()->Get<bool>("debugger.holdAnalysis");
+				if (shouldHoldAnalysis)
+					data->SetAnalysisHold(false);
+
+				auto viewType = data->GetTypeName();
+				result = fileMetadata->Rebase(data, remoteBase, progress);
+				if (!result)
+					return;
+
+				auto rebasedView = fileMetadata->GetViewOfType(viewType);
+				if (!rebasedView)
+					return;
+
+				if (shouldHoldAnalysis)
+				{
+					static auto completionEvent = rebasedView->AddAnalysisCompletionEvent([=](){
+						rebasedView->SetAnalysisHold(true);
+					});
+					rebasedView->UpdateAnalysis();
+				}
+			});
+		task->wait();
+
+		if (!result)
+		{
+			LogWarn("failed to rebase the input view");
+			return;
+		}
+
+		m_controller->ReAddDebuggerMemoryRegion();
+
+		ViewFrame* frame = m_context->getCurrentViewFrame();
+		if (!frame)
+			return;
+
+		FileContext* fileContext = frame->getFileContext();
+		if (!fileContext)
+			return;
+
+		fileContext->refreshDataViewCache();
+		m_context->recreateViewFrames(fileContext);
+		navigateToCurrentIP();
+		QCoreApplication::processEvents();
+	});
+}
+
+
 void DebuggerUI::updateUI(const DebuggerEvent& event)
 {
+	if ((event.type == LaunchEventType) || (event.type == AttachEventType) || (event.type == ConnectEventType))
+	{
+		auto* globalUI = GlobalDebuggerUI::GetForContext(m_context);
+		if (globalUI)
+			globalUI->SetDisplayingGlobalAreaWidgets(true);
+	}
+
 	switch (event.type)
 	{
 	case DetachedEventType:
@@ -1208,69 +1533,6 @@ void DebuggerUI::updateUI(const DebuggerEvent& event)
 
 		navigateToCurrentIP();
 		checkFocusDebuggerConsole();
-		break;
-	}
-
-	case ModuleLoadedEvent:
-	{
-		uint64_t remoteBase = event.data.absoluteAddress;
-		Ref<BinaryView> data = m_controller->GetData();
-		FileMetadataRef fileMetadata = data->GetFile();
-		ViewFrame* frame = m_context->getCurrentViewFrame();
-
-		if (remoteBase != m_controller->GetViewFileSegmentsStart())
-		{
-			m_controller->RemoveDebuggerMemoryRegion();
-			bool result = false;
-			QString text = QString("Rebasing the input view...");
-			ProgressTask* task =
-				new ProgressTask(frame, "Rebase", text, "Cancel", [&](ProgressFunction progress) {
-					// If analysis hold during debugging is active, we must first turn it off, rebase, wait for the
-					// analysis to complete, and then set the analysis hold back on. This is because during rebasing,
-					// all the advanced analysis data is discarded has to be regenerated. If we still holds the
-					// analysis, these function will become un-analyzed and not show up in the linear view
-					auto shouldHoldAnalysis = Settings::Instance()->Get<bool>("debugger.holdAnalysis");
-					if (shouldHoldAnalysis)
-						data->SetAnalysisHold(false);
-
-					auto viewType = data->GetTypeName();
-					result = fileMetadata->Rebase(data, remoteBase, progress);
-					auto rebasedView = fileMetadata->GetViewOfType(viewType);
-					if (!rebasedView)
-						return;
-
-					if (shouldHoldAnalysis)
-					{
-						static auto completionEvent = rebasedView->AddAnalysisCompletionEvent([=](){
-							rebasedView->SetAnalysisHold(true);
-						});
-						rebasedView->UpdateAnalysis();
-					}
-				});
-			task->wait();
-
-			if (!result)
-			{
-				LogWarn("failed to rebase the input view");
-				break;
-			}
-
-			m_controller->ReAddDebuggerMemoryRegion();
-
-			ViewFrame* frame = m_context->getCurrentViewFrame();
-			if (!frame)
-				break;
-
-			FileContext* fileContext = frame->getFileContext();
-			if (!fileContext)
-				break;
-
-			fileContext->refreshDataViewCache();
-			m_context->recreateViewFrames(fileContext);
-			navigateToCurrentIP();
-			QCoreApplication::processEvents();
-		}
-
 		break;
 	}
 
@@ -1365,6 +1627,8 @@ void GlobalDebuggerUI::InitializeUI()
 	Sidebar::addSidebarWidgetType(new DebugModulesSidebarWidgetType());
 	Sidebar::addSidebarWidgetType(new ThreadFramesSidebarWidgetType());
 	Sidebar::addSidebarWidgetType(new DebugInfoWidgetType());
+	Sidebar::addSidebarWidgetType(new TTDMemoryWidgetType());
+	Sidebar::addSidebarWidgetType(new TTDCallsWidgetType());
 }
 
 
@@ -1472,4 +1736,44 @@ extern "C"
 		RegisterRenderLayers();
 		return true;
 	}
+}
+
+
+ActiveDebugSessionSidebarContentClassifier::ActiveDebugSessionSidebarContentClassifier(BinaryViewRef data)
+{
+	m_debugger = DebuggerController::GetController(data);
+	if (m_debugger)
+	{
+		if (m_debugger->IsConnected())
+			m_contentClassification = SidebarHasRelevantContent;
+
+		m_eventIndex = m_debugger->RegisterEventCallback(
+			[this](const DebuggerEvent& event) {
+				switch (event.type)
+				{
+				case LaunchEventType:
+				case ResumeEventType:
+				case StepIntoEventType:
+				case TargetStoppedEventType:
+					m_contentClassification = SidebarHasRelevantContent;
+					Q_EMIT contentClassificationChanged();
+					break;
+				case DetachedEventType:
+				case LaunchFailureEventType:
+					m_contentClassification = SidebarHasNoContent;
+					Q_EMIT contentClassificationChanged();
+					break;
+				default:
+					break;
+				}
+			},
+			"Active Debug Session Sidebar Content Classifier");
+	}
+}
+
+
+ActiveDebugSessionSidebarContentClassifier::~ActiveDebugSessionSidebarContentClassifier()
+{
+	if (m_debugger)
+		m_debugger->RemoveEventCallback(m_eventIndex);
 }

@@ -133,7 +133,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForLLILConditions(LowLe
 
 	auto func = llil->GetFunction();
 	auto condition = instr.GetConditionExpr<LLIL_IF>();
-	uint64_t value;
+	intx::uint512 value;
 	if (!m_debugger->ComputeExprValue(llil, condition, value))
 		return result;
 
@@ -167,7 +167,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForLLIL(LowLevelILFunct
 		{
 		case ExprLowLevelOperand:
 		{
-			uint64_t value;
+			intx::uint512 value;
 			if (!m_debugger->ComputeExprValue(llil, operand.GetExpr(), value))
 				continue;
 			std::vector<InstructionTextToken> tokens;
@@ -220,7 +220,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForMLIL(MediumLevelILFu
 		{
 		case ExprMediumLevelOperand:
 		{
-			uint64_t value;
+			intx::uint512 value;
 			if (!m_debugger->ComputeExprValue(mlil, operand.GetExpr(), value))
 				continue;
 			std::vector<InstructionTextToken> tokens;
@@ -232,7 +232,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForMLIL(MediumLevelILFu
 		}
 		case VariableMediumLevelOperand:
 		{
-			uint64_t value;
+			intx::uint512 value;
 			auto var = operand.GetVariable();
 			if (!m_debugger->GetVariableValue(var, instr.address, instr.size, value))
 				break;
@@ -352,7 +352,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForMLILConditions(Mediu
 
 	auto func = mlil->GetFunction();
 	auto condition = instr.GetConditionExpr<MLIL_IF>();
-	uint64_t value;
+	intx::uint512 value;
 	if (!m_debugger->ComputeExprValue(mlil, condition, value))
 		return result;
 
@@ -387,7 +387,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForHLIL(HighLevelILFunc
 		{
 		case ExprHighLevelOperand:
 		{
-			uint64_t value;
+			intx::uint512 value;
 			if (!m_debugger->ComputeExprValue(hlil, operand.GetExpr(), value))
 				continue;
 			std::vector<DisassemblyTextLine> lines = hlil->GetExprText(operand.GetExpr().exprIndex);
@@ -405,7 +405,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForHLIL(HighLevelILFunc
 		}
 		case VariableHighLevelOperand:
 		{
-			uint64_t value;
+			intx::uint512 value;
 			auto var = operand.GetVariable();
 			if (!m_debugger->GetVariableValue(var, instr.address, instr.size, value))
 				break;
@@ -525,7 +525,7 @@ std::vector<DebuggerInfoEntry> DebuggerInfoTable::getInfoForHLILConditions(HighL
 
 	auto func = hlil->GetFunction();
 	auto condition = instr.GetConditionExpr<HLIL_IF>();
-	uint64_t value;
+	intx::uint512 value;
 	if (!m_debugger->ComputeExprValue(hlil, condition, value))
 		return result;
 
@@ -568,7 +568,7 @@ vector<DebuggerInfoEntry> DebuggerInfoTable::getILInfoEntries(const ViewLocation
 		auto llil = func->GetLowLevelILIfAvailable();
 		if (!llil)
 			break;
-		auto llils = func->GetLowLevelILInstructionsForAddress(func->GetArchitecture(), addr);
+		auto llils = llil->GetInstructionsAt(func->GetArchitecture(), addr);
 		for (const auto index: llils)
 		{
 			auto instr = llil->GetInstruction(index);
@@ -691,7 +691,7 @@ void DebuggerInfoEntryItemDelegate::paint(QPainter *painter, const QStyleOptionV
 	}
 	case ValueColumn:
 		painter->setPen(getThemeColor(AddressColor));
-		painter->drawText(textRect, "0x" + QString::number(entry->value, 16));
+		painter->drawText(textRect, QString::fromStdString("0x") + QString::fromStdString(intx::hex(entry->value)));
 		break;
 	case HintColumn:
 		painter->setPen(getThemeColor(StringColor));
@@ -802,7 +802,7 @@ QVariant DebuggerInfoEntryItemModel::data(const QModelIndex &index, int role) co
 		}
 		case ValueColumn:
 		{
-			auto str = "0x" + QString::number(item->value, 16);
+			auto str = QString::fromStdString("0x") + QString::fromStdString(intx::hex(item->value));
 			result.setValue(str.size());
 			break;
 		}
@@ -909,7 +909,7 @@ void DebuggerInfoTable::onDoubleClicked()
 		return;
 
 	auto info = m_model->getRow(sel[0].row());
-	uint64_t value = info.value;
+	uint64_t value = (uint64_t)info.value;
 
 	UIContext* context = UIContext::contextForWidget(this);
 	if (!context)
@@ -933,4 +933,10 @@ DebugInfoWidgetType::DebugInfoWidgetType():
 SidebarWidget* DebugInfoWidgetType::createWidget(ViewFrame*, BinaryViewRef data)
 {
 	return new DebugInfoSidebarWidget(data);
+}
+
+
+SidebarContentClassifier* DebugInfoWidgetType::contentClassifier(ViewFrame*, BinaryViewRef data)
+{
+	return new ActiveDebugSessionSidebarContentClassifier(data);
 }

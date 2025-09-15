@@ -131,7 +131,8 @@ namespace BinaryNinjaDebugger {
 		IDebugRegisters* m_debugRegisters {nullptr};
 		IDebugSymbols3* m_debugSymbols {nullptr};
 		IDebugSystemObjects* m_debugSystemObjects {nullptr};
-		bool m_debugActive {false};
+		bool m_dbgengInitialized {false};
+		bool m_activelyDebugging {false};
 
 		virtual bool Start();
 		virtual void Reset();
@@ -153,6 +154,8 @@ namespace BinaryNinjaDebugger {
 
         std::string m_pdbFileName {};
         bool m_usePDBFileName = true;
+
+		std::recursive_mutex m_engineLoopMutex;
 
 	public:
 		inline static ProcessCallbackInformation ProcessCallbackInfo {};
@@ -200,7 +203,7 @@ namespace BinaryNinjaDebugger {
 		std::string GetRegisterNameByIndex(std::uint32_t index) const;
 		std::unordered_map<std::string, DebugRegister> ReadAllRegisters() override;
 		DebugRegister ReadRegister(const std::string& reg) override;
-		bool WriteRegister(const std::string& reg, std::uintptr_t value) override;
+		bool WriteRegister(const std::string& reg, intx::uint512 value) override;
 		std::vector<std::string> GetRegisterList() const;
 
 		DataBuffer ReadMemory(std::uintptr_t address, std::size_t size) override;

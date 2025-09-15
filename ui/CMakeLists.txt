@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.9...3.15 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
 
 project(debuggerui)
 
@@ -6,7 +6,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 find_package(Qt6 COMPONENTS Core Gui Widgets REQUIRED)
 
-file(GLOB SOURCES *.cpp *.h ../debuggerui.qrc)
+file(GLOB SOURCES CONFIGURE_DEPENDS *.cpp *.h ../debuggerui.qrc)
 list(FILTER SOURCES EXCLUDE REGEX moc_.*)
 list(FILTER SOURCES EXCLUDE REGEX qrc_.*)
 if (NOT WIN32)
@@ -21,6 +21,7 @@ else()
 endif()
 
 if(BN_INTERNAL_BUILD)
+    ui_plugin_rpath(debuggerui)
     set_target_properties(debuggerui PROPERTIES
             LIBRARY_OUTPUT_DIRECTORY ${BN_CORE_PLUGIN_DIR}
             RUNTIME_OUTPUT_DIRECTORY ${BN_CORE_PLUGIN_DIR})
@@ -32,7 +33,7 @@ else()
 endif()
 
 set_target_properties(debuggerui PROPERTIES
-        CXX_STANDARD 17
+        CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
@@ -40,4 +41,3 @@ set_target_properties(debuggerui PROPERTIES
         )
 
 target_link_libraries(debuggerui debuggerapi binaryninjaui Qt6::Core Qt6::Gui Qt6::Widgets)
-

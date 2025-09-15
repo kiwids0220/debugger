@@ -18,6 +18,7 @@ limitations under the License.
 
 #include "binaryninjaapi.h"
 #include "ffi.h"
+#include "../vendor/intx/intx.hpp"
 
 using namespace BinaryNinja;
 
@@ -346,7 +347,7 @@ namespace BinaryNinjaDebuggerAPI {
 	struct DebugRegister
 	{
 		std::string m_name {};
-		std::uintptr_t m_value {};
+		intx::uint512 m_value {};
 		std::size_t m_width {}, m_registerIndex {};
 		std::string m_hint {};
 	};
@@ -440,6 +441,83 @@ namespace BinaryNinjaDebuggerAPI {
 	};
 
 
+	struct DebuggerUICallbacks
+	{
+		std::function<void(uint64_t base)> rebaseBinaryViewImpl;
+
+		BNDebuggerUICallbacks m_callbacks;
+		BNDebuggerUICallbacks* GetCallbacks() { return &m_callbacks; }
+
+		DebuggerUICallbacks();
+	};
+
+
+	// TTD (Time Travel Debugging) structures
+	enum TTDMemoryAccessType
+	{
+		TTDMemoryRead = 1,
+		TTDMemoryWrite = 2,
+		TTDMemoryExecute = 4
+	};
+
+	struct TTDPosition
+	{
+		uint64_t sequence;
+		uint64_t step;
+		
+		TTDPosition() : sequence(0), step(0) {}
+		TTDPosition(uint64_t seq, uint64_t st) : sequence(seq), step(st) {}
+		
+		bool operator==(const TTDPosition& other) const
+		{
+			return sequence == other.sequence && step == other.step;
+		}
+		
+		bool operator<(const TTDPosition& other) const
+		{
+			if (sequence < other.sequence)
+				return true;
+			if (sequence > other.sequence)
+				return false;
+			return step < other.step;
+		}
+	};
+
+	struct TTDMemoryEvent
+	{
+		std::string eventType;         // Event type (e.g., "MemoryAccess")
+		uint32_t threadId;             // Thread ID that performed the access
+		uint32_t uniqueThreadId;       // Unique thread identifier
+		TTDPosition timeStart;         // Position when event started
+		TTDPosition timeEnd;           // Position when event ended
+		TTDMemoryAccessType accessType; // Type of memory access (parsed from object)
+		uint64_t address;              // Memory address accessed
+		uint64_t size;                 // Size of memory access
+		uint64_t memoryAddress;        // Memory address (may be same as address)
+		uint64_t instructionAddress;   // IP - Address of instruction that caused the access
+		uint64_t value;                // Value that was read/written/executed
+		
+		TTDMemoryEvent() : threadId(0), uniqueThreadId(0), accessType(TTDMemoryRead), address(0), size(0), memoryAddress(0), instructionAddress(0), value(0) {}
+	};
+
+	struct TTDCallEvent
+	{
+		std::string eventType;         // Event type (always "Call" for TTD.Calls objects)
+		uint32_t threadId;             // OS thread ID of thread that made the call
+		uint32_t uniqueThreadId;       // Unique ID for the thread across the trace
+		std::string function;          // Symbolic name of the function
+		uint64_t functionAddress;      // Function's address in memory
+		uint64_t returnAddress;        // Instruction to return to after the call
+		uint64_t returnValue;          // Return value of the function (if not void)
+		bool hasReturnValue;           // Whether the function has a return value
+		std::vector<std::string> parameters; // Array containing parameters passed to the function
+		TTDPosition timeStart;         // Position when call started
+		TTDPosition timeEnd;           // Position when call ended
+		
+		TTDCallEvent() : threadId(0), uniqueThreadId(0), functionAddress(0), returnAddress(0), returnValue(0), hasReturnValue(false) {}
+	};
+
+
 	typedef BNDebugAdapterConnectionStatus DebugAdapterConnectionStatus;
 	typedef BNDebugAdapterTargetStatus DebugAdapterTargetStatus;
 
@@ -451,8 +529,12 @@ namespace BinaryNinjaDebuggerAPI {
 			std::function<void(const DebuggerEvent&)> action;
 		};
 
+		// Map callback indices to their respective objects
+		std::unordered_map<size_t, DebuggerEventCallbackObject*> m_callbackObjects;
+
 	public:
 		DebuggerController(BNDebuggerController* controller);
+		~DebuggerController();
 		static DbgRef<DebuggerController> GetController(Ref<BinaryNinja::BinaryView> data);
 		static bool ControllerExists(Ref<BinaryNinja::BinaryView> data);
 		static DbgRef<DebuggerController> GetController(Ref<BinaryNinja::FileMetadata> file);
@@ -482,8 +564,8 @@ namespace BinaryNinjaDebuggerAPI {
 
 		std::vector<DebugModule> GetModules();
 		std::vector<DebugRegister> GetRegisters();
-		uint64_t GetRegisterValue(const std::string& name);
-		bool SetRegisterValue(const std::string& name, uint64_t value);
+		intx::uint512 GetRegisterValue(const std::string& name);
+		bool SetRegisterValue(const std::string& name, const intx::uint512& value);
 
 		// target control
 		bool Launch();
@@ -576,6 +658,8 @@ namespace BinaryNinjaDebuggerAPI {
 
 		void RemoveEventCallback(size_t index);
 
+		void SetDebuggerUICallbacks(DebuggerUICallbacks* cb);
+
 		void WriteStdin(const std::string& msg);
 
 		std::string InvokeBackendCommand(const std::string& command);
@@ -588,13 +672,19 @@ namespace BinaryNinjaDebuggerAPI {
 
 		bool ActivateDebugAdapter();
 
-		std::string GetAddressInformation(uint64_t address);
+		std::string GetAddressInformation(intx::uint512 address);
 		bool IsFirstLaunch();
 		bool IsFirstConnect();
 		bool IsFirstConnectToDebugServer();
 		bool IsFirstAttach();
 
 		bool IsTTD();
+
+		// TTD Memory Analysis Methods
+		std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t address, uint64_t size, TTDMemoryAccessType accessType = TTDMemoryRead);
+		std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0);
+		TTDPosition GetCurrentTTDPosition();
+		bool SetTTDPosition(const TTDPosition& position);
 
 		void PostDebuggerEvent(const DebuggerEvent& event);
 
@@ -604,14 +694,16 @@ namespace BinaryNinjaDebuggerAPI {
 		uint64_t GetViewFileSegmentsStart();
 
 		bool ComputeExprValue(const Ref<LowLevelILFunction>& func, const LowLevelILInstruction& expr,
-			  uint64_t & value);
+			  intx::uint512 & value);
 		bool ComputeExprValue(const Ref<MediumLevelILFunction>& func, const MediumLevelILInstruction& expr,
-							  uint64_t & value);
+							  intx::uint512 & value);
 		bool ComputeExprValue(const Ref<HighLevelILFunction>& func, const HighLevelILInstruction& expr,
-							  uint64_t & value);
-		bool GetVariableValue(Variable& var, uint64_t address, size_t size, uint64_t& value);
+							  intx::uint512 & value);
+		bool GetVariableValue(Variable& var, uint64_t address, size_t size, intx::uint512& value);
 
 		Ref<Settings> GetAdapterSettings();
+
+		bool FunctionExistsInOldView(uint64_t address);
 	};
 
 

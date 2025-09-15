@@ -36,11 +36,18 @@ DebuggerController::DebuggerController(BinaryViewRef data): BinaryDataNotificati
 	m_adapter = nullptr;
 	m_shouldAnnotateStackVariable = Settings::Instance()->Get<bool>("debugger.stackVariableAnnotations");
 	RegisterEventCallback([this](const DebuggerEvent& event) { EventHandler(event); }, "Debugger Core");
+
+	m_debuggerEventThread = std::thread([&]{ DebuggerMainThread(); });
 }
 
 
 DebuggerController::~DebuggerController()
 {
+	m_shouldExit = true;
+	m_cv.notify_all();
+	if (m_debuggerEventThread.joinable())
+		m_debuggerEventThread.join();
+
 	m_data->UnregisterNotification(this);
 	m_file = nullptr;
 
@@ -118,6 +125,10 @@ bool DebuggerController::SetIP(uint64_t address)
 
 bool DebuggerController::Launch()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return false;
+
 	std::thread([&]() { LaunchAndWait(); }).detach();
 	return true;
 }
@@ -159,6 +170,10 @@ DebugStopReason DebuggerController::LaunchAndWaitInternal()
 
 DebugStopReason DebuggerController::LaunchAndWait()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return InvalidStatusOrOperation;
+
 	if (!m_targetControlMutex.try_lock())
 		return InternalError;
 
@@ -173,6 +188,10 @@ DebugStopReason DebuggerController::LaunchAndWait()
 
 bool DebuggerController::Attach()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return false;
+
 	std::thread([&]() { AttachAndWait(); }).detach();
 	return true;
 }
@@ -202,6 +221,10 @@ DebugStopReason DebuggerController::AttachAndWaitInternal()
 
 DebugStopReason DebuggerController::AttachAndWait()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return InvalidStatusOrOperation;
+
 	if (!m_targetControlMutex.try_lock())
 		return InternalError;
 
@@ -216,6 +239,10 @@ DebugStopReason DebuggerController::AttachAndWait()
 
 bool DebuggerController::Connect()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return false;
+
 	std::thread([&]() { ConnectAndWait(); }).detach();
 	return true;
 }
@@ -245,6 +272,10 @@ DebugStopReason DebuggerController::ConnectAndWaitInternal()
 
 DebugStopReason DebuggerController::ConnectAndWait()
 {
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanStartDebgging())
+		return InvalidStatusOrOperation;
+
 	if (!m_targetControlMutex.try_lock())
 		return InternalError;
 
@@ -325,6 +356,12 @@ bool DebuggerController::CreateDebugAdapter()
 void DebuggerController::ApplyBreakpoints()
 {
 	m_state->ApplyBreakpoints();
+}
+
+
+bool DebuggerController::CanStartDebgging()
+{
+	return !m_state->IsConnected();
 }
 
 
@@ -1113,6 +1150,8 @@ bool DebuggerController::CreateDebuggerBinaryView()
 		data->SetAnalysisHold(true);
 	}
 
+	m_state->GetMemory()->PrefillValueCache();
+
 	m_accessor = new DebuggerFileAccessor(data);
 	data->SetFunctionAnalysisUpdateDisabled(true);
 	data->GetMemoryMap()->AddRemoteMemoryRegion("debugger", 0, m_accessor);
@@ -1133,50 +1172,62 @@ void DebuggerController::DetectLoadedModule()
 	if (m_inputFileLoaded || (!m_state->GetRemoteBase(remoteBase)))
 		return;
 
+	m_inputFileLoaded = true;
+	auto oldBase = GetViewFileSegmentsStart();
+	if (remoteBase == oldBase)
+		return;
+
+	m_ranges.clear();
+	m_oldViewBase = oldBase;
+	m_newViewBase = remoteBase;
+	auto data = GetData();
+	for (const auto& func: data->GetAnalysisFunctionList())
+	{
+		for (const auto& range: func->GetAddressRanges())
+			m_ranges.emplace_back(range);
+	}
+
 	if (BinaryNinja::IsUIEnabled())
 	{
 		// When the UI is enabled, let the debugger UI do the work. It can show a progress bar if the operation takes
 		// a while.
-		DebuggerEvent event;
-		event.type = ModuleLoadedEvent;
-		event.data.absoluteAddress = remoteBase;
-		PostDebuggerEvent(event);
+		if (m_uiCallbacks)
+			m_uiCallbacks->NotifyRebaseBinaryView(remoteBase);
 	}
 	else
 	{
-		if (remoteBase != GetViewFileSegmentsStart())
+		// Halt analysis before rebasing. Otherwise, the old view may continue analysis which leads to various issues
+		data->AbortAnalysis();
+		data->UpdateAnalysisAndWait();
+
+		RemoveDebuggerMemoryRegion();
+
+		auto shouldHoldAnalysis = Settings::Instance()->Get<bool>("debugger.holdAnalysis");
+		if (shouldHoldAnalysis)
+			data->SetAnalysisHold(false);
+
+		// remote base is different from the local base, first need a rebase
+		auto viewType = data->GetTypeName();
+		if (!m_file->Rebase(data, remoteBase, [&](size_t cur, size_t total) { return true; }))
 		{
-			RemoveDebuggerMemoryRegion();
-
-			auto shouldHoldAnalysis = Settings::Instance()->Get<bool>("debugger.holdAnalysis");
-			auto data = GetData();
-			if (shouldHoldAnalysis)
-				data->SetAnalysisHold(false);
-
-			// remote base is different from the local base, first need a rebase
-			auto viewType = data->GetTypeName();
-			if (!m_file->Rebase(data, remoteBase, [&](size_t cur, size_t total) { return true; }))
-			{
-				LogWarn("rebase failed");
-			}
-			auto rebasedView = m_file->GetViewOfType(viewType);
-			if (!rebasedView)
-				return;
-
-			if (shouldHoldAnalysis)
-			{
-				static auto completionEvent = rebasedView->AddAnalysisCompletionEvent([=](){
-					rebasedView->SetAnalysisHold(true);
-				});
-				rebasedView->UpdateAnalysis();
-			}
-
-			ReAddDebuggerMemoryRegion();
+			LogWarn("rebase failed");
 		}
+		auto rebasedView = m_file->GetViewOfType(viewType);
+		if (!rebasedView)
+			return;
+
+		if (shouldHoldAnalysis)
+		{
+			static auto completionEvent = rebasedView->AddAnalysisCompletionEvent([=](){
+				rebasedView->SetAnalysisHold(true);
+			});
+			rebasedView->UpdateAnalysis();
+		}
+
+		ReAddDebuggerMemoryRegion();
 	}
 
 	GetData()->UpdateAnalysis();
-	m_inputFileLoaded = true;
 }
 
 
@@ -1286,6 +1337,12 @@ bool DebuggerController::DisconnectDebugServer()
 }
 
 
+bool DebuggerController::IsConnectedToDebugServer()
+{
+	return m_state->IsConnectedToDebugServer();
+}
+
+
 void DebuggerController::Detach()
 {
 	if (!m_state->IsConnected())
@@ -1352,7 +1409,7 @@ void DebuggerController::QuitAndWait()
 
 bool DebuggerController::Pause()
 {
-	if (!(m_state->IsConnected() && m_state->IsRunning()))
+	if (!m_state->IsConnected())
 		return false;
 
 	std::thread([&]() { PauseAndWait(); }).detach();
@@ -1370,6 +1427,9 @@ DebugStopReason DebuggerController::PauseAndWaitInternal()
 
 DebugStopReason DebuggerController::PauseAndWait()
 {
+	if (!m_state->IsConnected())
+		return InvalidStatusOrOperation;
+
 	auto reason = PauseAndWaitInternal();
 	if ((reason != ProcessExited) && (reason != InternalError))
 		NotifyStopped(reason);
@@ -1506,7 +1566,7 @@ DbgRef<DebuggerController> DebuggerController::GetController(BinaryViewRef data)
 		DebuggerController* controller = g_debuggerControllers[i];
 		if (!controller)
 			continue;
-		if (controller->m_file.operator==(data->GetFile()))
+		if (controller->m_file == data->GetFile())
 			return controller;
 	}
 
@@ -1632,6 +1692,8 @@ void DebuggerController::EventHandler(const DebuggerEvent& event)
 	case DetachedEventType:
 	case LaunchFailureEventType:
 	{
+		m_state->SetConnectionStatus(DebugAdapterNotConnectedStatus);
+		m_state->SetExecutionStatus(DebugAdapterInvalidStatus);
 		m_state->MarkDirty();
 		m_inputFileLoaded = false;
 		m_initialBreakpointSeen = false;
@@ -1648,18 +1710,17 @@ void DebuggerController::EventHandler(const DebuggerEvent& event)
 		}
 		m_lastIP = m_currentIP;
 		m_currentIP = 0;
-		m_state->SetConnectionStatus(DebugAdapterNotConnectedStatus);
-		m_state->SetExecutionStatus(DebugAdapterInvalidStatus);
 		break;
 	}
 	case TargetStoppedEventType:
 	{
-		m_state->MarkDirty();
-		m_state->UpdateCaches();
 		m_state->SetConnectionStatus(DebugAdapterConnectedStatus);
 		m_state->SetExecutionStatus(DebugAdapterPausedStatus);
+		m_state->MarkDirty();
+		m_state->UpdateCaches();
 		m_lastIP = m_currentIP;
 		m_currentIP = m_state->IP();
+		m_ranges.clear();
 
 		DetectLoadedModule();
 		UpdateStackVariables();
@@ -1695,7 +1756,7 @@ void DebuggerController::EventHandler(const DebuggerEvent& event)
 size_t DebuggerController::RegisterEventCallback(
 	std::function<void(const DebuggerEvent&)> callback, const std::string& name)
 {
-	std::unique_lock<std::recursive_mutex> lock(m_callbackMutex);
+	std::unique_lock lock(m_callbackMutex);
 	DebuggerEventCallback object;
 	object.function = callback;
 	object.index = m_callbackIndex++;
@@ -1707,9 +1768,22 @@ size_t DebuggerController::RegisterEventCallback(
 
 bool DebuggerController::RemoveEventCallback(size_t index)
 {
-	std::unique_lock<std::recursive_mutex> lock(m_callbackMutex);
-	m_disabledCallbacks.insert(index);
-	return RemoveEventCallbackInternal(index);
+	std::unique_lock lock(m_callbackMutex);
+	for (auto it = m_eventCallbacks.begin(); it != m_eventCallbacks.end(); it++)
+	{
+		if (it->index == index)
+		{
+			// It is fine to directly remove the callback from m_eventCallbacks. Because in DebuggerMainThread, the
+			// code makes a copy of the events before trying to dispatch them.
+			// The reason that we need m_disabledCallbacks is because during dispatching of an earlier event, the code
+			// may lead to the deletion of a later event. In that case, the change is not reflected on the copy of the
+			// list, so we must look up the index in m_disabledCallbacks before dispatching them
+			m_disabledCallbacks.insert(index);
+			m_eventCallbacks.erase(it);
+			return true;
+		}
+	}
+	return false;
 }
 
 
@@ -1727,16 +1801,69 @@ bool DebuggerController::RemoveEventCallbackInternal(size_t index)
 }
 
 
+// The design goal here is:
+// 1. The PostDebuggerEvent is blocking, i.e., it only returns when the event has been processed. This is important for
+// ensuring proper internal state updates. The only exception is that when a new debugger event is posted from one of
+// the callbacks (the caller is already in the dispatcher loop), then PostDebuggerEvent will only queue the event but
+// not block on it. Because doing so will cause a deadlock.
+// 2. Thread-safe. Any thread can call PostDebuggerEvent and not cause unexpected behavior
+// 3. Re-entrant safe. PostDebuggerEvent can be called within a callback, and there would not be chaos. But at the same
+// time, as mentioned above, when it is re-entered from the dispatcher loop, the call is non-blocking. This means that
+// in DebuggerController::DetectLoadedModule(), the code cannot post a ModuleLoadedEvent and block on it. Instead, a
+// direct callback must be used to inform the UI to perform the rebase, and then the core can continue its processing
+
 void DebuggerController::PostDebuggerEvent(const DebuggerEvent& event)
 {
-	std::unique_lock<std::recursive_mutex> callbackLock(m_callbackMutex);
-	std::list<DebuggerEventCallback> eventCallbacks = m_eventCallbacks;
-	callbackLock.unlock();
+	auto pending = std::make_shared<PendingEvent>();
+	pending->event = event;
+	std::future<void> future = pending->done.get_future();
 
-	if (event.type == AdapterStoppedEventType)
-		m_lastAdapterStopEventConsumed = false;
+	{
+		std::lock_guard lock(m_eventsMutex);
+		m_eventQueue.push(pending);
+	}
+	m_cv.notify_one();
 
-	ExecuteOnMainThreadAndWait([&]() {
+	if (std::this_thread::get_id() == m_dispatcherThreadId)
+	{
+		// Posting a new debugger event from a callback should be *fine*, but it will also be non-blocking, so we should
+		// be aware of that
+		LogWarn("A debugger event with type %d is posted from the dispatcher thread and is unexpected", event.type);
+	}
+	else
+	{
+		// Block until the event is handled (unless this is the dispatcher thread)
+		future.get();
+	}
+}
+
+
+void DebuggerController::DebuggerMainThread()
+{
+	m_shouldExit = false;
+	m_dispatcherThreadId = std::this_thread::get_id();
+
+	while (true)
+	{
+		std::shared_ptr<PendingEvent> current;
+		std::unique_lock lock(m_eventsMutex);
+		m_cv.wait(lock, [&] { return !m_eventQueue.empty() || m_shouldExit; });
+
+		if (m_shouldExit && m_eventQueue.empty())
+			break;
+
+		current = m_eventQueue.front();
+		m_eventQueue.pop();
+		lock.unlock();
+
+		std::unique_lock callbackLock(m_callbackMutex);
+		std::list<DebuggerEventCallback> eventCallbacks = m_eventCallbacks;
+		callbackLock.unlock();
+
+		auto event = current->event;
+		if (event.type == AdapterStoppedEventType)
+			m_lastAdapterStopEventConsumed = false;
+
 		DebuggerEvent eventToSend = event;
 		if ((eventToSend.type == TargetStoppedEventType) && !m_initialBreakpointSeen)
 		{
@@ -1746,14 +1873,17 @@ void DebuggerController::PostDebuggerEvent(const DebuggerEvent& event)
 
 		for (const DebuggerEventCallback& cb : eventCallbacks)
 		{
+			std::unique_lock callbackLock2(m_callbackMutex);
 			if (m_disabledCallbacks.find(cb.index) != m_disabledCallbacks.end())
 				continue;
 
+			callbackLock2.unlock();
 			cb.function(eventToSend);
 		}
 
 		// If the current event is an AdapterStoppedEvent, and it is not consumed by any callback, then the adapter
-		// stop is not caused by the debugger core. Notify a target stop reason in this case.
+		// stop is not caused by the debugger core. This can happen when the user run a "ni" command directly.
+		// Notify a target stop reason in this case.
 		if (event.type == AdapterStoppedEventType && !m_lastAdapterStopEventConsumed)
 		{
 			DebuggerEvent stopEvent = event;
@@ -1765,25 +1895,26 @@ void DebuggerController::PostDebuggerEvent(const DebuggerEvent& event)
 			}
 			for (const DebuggerEventCallback& cb : eventCallbacks)
 			{
+				std::unique_lock callbackLock2(m_callbackMutex);
 				if (m_disabledCallbacks.find(cb.index) != m_disabledCallbacks.end())
 					continue;
 
+				callbackLock2.unlock();
 				cb.function(stopEvent);
 			}
 		}
-	});
 
-	CleanUpDisabledEvent();
+		CleanUpDisabledEvent();
+		current->done.set_value();
+	}
 }
 
 
 void DebuggerController::CleanUpDisabledEvent()
 {
-	std::unique_lock<std::recursive_mutex> lock(m_callbackMutex);
-	for (const auto index : m_disabledCallbacks)
-	{
-		RemoveEventCallbackInternal(index);
-	}
+	std::unique_lock lock(m_callbackMutex);
+	// We only need to clear the vector of index here because the entries in m_eventCallbacks have already been
+	// deleted by RemoveEventCallback
 	m_disabledCallbacks.clear();
 }
 
@@ -1882,13 +2013,13 @@ std::vector<DebugRegister> DebuggerController::GetAllRegisters()
 }
 
 
-uint64_t DebuggerController::GetRegisterValue(const std::string& name)
+intx::uint512 DebuggerController::GetRegisterValue(const std::string& name)
 {
 	return m_state->GetRegisters()->GetRegisterValue(name);
 }
 
 
-bool DebuggerController::SetRegisterValue(const std::string& name, uint64_t value)
+bool DebuggerController::SetRegisterValue(const std::string& name, intx::uint512 value)
 {
 	return m_state->GetRegisters()->SetRegisterValue(name, value);
 }
@@ -1965,7 +2096,7 @@ void DebuggerController::ProcessOneVariable(uint64_t varAddress, Confidence<Ref<
 		GetData()->DefineDataVariable(varAddress, type);
 		if (!name.empty())
 		{
-			SymbolRef sym = new Symbol(DataSymbol, name, name, name, varAddress);
+			SymbolRef sym = new BinaryNinja::Symbol(DataSymbol, name, name, name, varAddress);
 			GetData()->DefineUserSymbol(sym);
 		}
 		m_debuggerVariables[varAddress] = varNameAndType;
@@ -2534,20 +2665,22 @@ static std::string CheckForPrintableString(const DataBuffer& memory)
 }
 
 
-static std::string CheckForLiteralString(uint64_t address)
+static std::string CheckForLiteralString(intx::uint512 value)
 {
 	bool ok = true;
 	bool zeroFound = false;
 	std::string result;
-	for (size_t i = 0; i < 8; i++)
+	for (size_t i = 0; i < 64; i++)
 	{
-		uint8_t c = (address >> (8 * i)) & 0xff;
+		uint8_t c = (uint8_t)(value >> (8 * i)) & 0xff;
 		if (IsPrintableChar(c) && (!zeroFound))
 		{
-			result = std::string(1, c) + result;
+			// Add the new char at the end to account for little-endianness
+			result += c;
 		}
 		else if (c == 0)
 		{
+			// Skip 0x0 (e.g., for unicode strings)
 			zeroFound = true;
 		}
 		else if (c != 0)
@@ -2558,17 +2691,20 @@ static std::string CheckForLiteralString(uint64_t address)
 	}
 
 	if (ok)
-		return fmt::format("\"{}\"", BinaryNinja::EscapeString(result));
+		return fmt::format("'{}'", BinaryNinja::EscapeString(result));
 
 	return "";
 }
 
 
-std::string DebuggerController::GetAddressInformation(uint64_t address)
+std::string DebuggerController::GetAddressInformation(intx::uint512 value)
 {
 	// Avoid too many results in the register widget when the address is 0x0
-	if (address == 0)
+	if (value == 0)
 		return "";
+
+	// For the first few things, they still need an address to work with
+	uint64_t address = (uint64_t)value;
 
 	const DataBuffer memory = ReadMemory(address, 128);
 	auto result = CheckForPrintableString(memory);
@@ -2636,7 +2772,7 @@ std::string DebuggerController::GetAddressInformation(uint64_t address)
 	}
 
 	// Check if the address itself is a printable string, e.g., 0x61626364 ==> "abcd"
-	result = CheckForLiteralString(address);
+	result = CheckForLiteralString(value);
 	if (!result.empty())
 		return result;
 
@@ -2676,6 +2812,85 @@ bool DebuggerController::IsTTD()
 }
 
 
+std::vector<TTDMemoryEvent> DebuggerController::GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType)
+{
+	std::vector<TTDMemoryEvent> events;
+	
+	if (!IsTTD())
+	{
+		LogError("Current adapter does not support TTD");
+		return events;
+	}
+	
+	if (m_adapter)
+	{
+		events = m_adapter->GetTTDMemoryAccessForAddress(startAddress, endAddress, accessType);
+	}
+
+	return events;
+}
+
+std::vector<TTDCallEvent> DebuggerController::GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress, uint64_t endReturnAddress)
+{
+	std::vector<TTDCallEvent> events;
+
+	if (!IsTTD())
+	{
+		LogError("Current adapter does not support TTD");
+		return events;
+	}
+
+	return m_adapter->GetTTDCallsForSymbols(symbols, startReturnAddress, endReturnAddress);
+}
+
+
+TTDPosition DebuggerController::GetCurrentTTDPosition()
+{
+	TTDPosition position;
+	
+	if (!IsTTD())
+	{
+		LogError("Current adapter does not support TTD");
+		return position;
+	}
+	
+	if (m_adapter)
+	{
+		position = m_adapter->GetCurrentTTDPosition();
+	}
+	
+	return position;
+}
+
+bool DebuggerController::SetTTDPosition(const TTDPosition& position)
+{
+	if (!IsTTD())
+	{
+		LogError("Current adapter does not support TTD");
+		return false;
+	}
+	
+	if (m_adapter)
+	{
+		return m_adapter->SetTTDPosition(position);
+	}
+
+	return false;
+}
+
+
+void DebuggerController::OnRebased(BinaryView* oldView, BinaryView* newView)
+{
+	m_data = newView;
+	m_viewStart = newView->GetStart();
+	// UnregisterNotification() is not designed to be called from one of the callbacks, so we cannot call it
+	// here. Also, there is no need to do so -- the oldView is about to be deleted
+	// oldView->UnregisterNotification(this);
+	newView->RegisterNotification(this);
+	m_state->GetMemory()->OnRebased();
+}
+
+
 bool DebuggerController::RemoveDebuggerMemoryRegion()
 {
 	GetData()->SetFunctionAnalysisUpdateDisabled(true);
@@ -2696,36 +2911,36 @@ bool DebuggerController::ReAddDebuggerMemoryRegion()
 
 
 // TODO: these 3 functions should be moved to the BinaryNinjaAPI namespace for wider audiences
-static int64_t MaskToSize(int64_t value, size_t size)
+static intx::uint512 MaskToSize(intx::uint512 value, size_t size)
 {
-	if (size >= 8)
+	if (size >= 64)
 		return value;
 	if (size == 0)
 		return value & 1;
-	return value & ((1LL << (size * 8)) - 1);
+	return value & ((intx::uint512(1) << (size * 8)) - 1);
 }
 
 
-static int64_t ZeroExtend(int64_t value, size_t sourceSize, size_t destSize)
+static intx::uint512 ZeroExtend(intx::uint512 value, size_t sourceSize, size_t destSize)
 {
 	if (destSize <= sourceSize)
 		return MaskToSize(value, destSize);
-	return MaskToSize(value & ((1LL << (sourceSize * 8)) - 1), destSize);
+	return MaskToSize(value & ((intx::uint512(1) << (sourceSize * 8)) - 1), destSize);
 }
 
 
-static int64_t SignExtend(int64_t value, size_t sourceSize, size_t destSize)
+static intx::uint512 SignExtend(intx::uint512 value, size_t sourceSize, size_t destSize)
 {
 	if (destSize <= sourceSize)
 		return MaskToSize(value, destSize);
 	if (value & (1LL << ((sourceSize * 8) - 1)))
-		return MaskToSize(value | (~((1LL << (sourceSize * 8)) - 1)), destSize);
+		return MaskToSize(value | (~((intx::uint512(1) << (sourceSize * 8)) - 1)), destSize);
 	else
-		return MaskToSize(value & ((1LL << (sourceSize * 8)) - 1), destSize);
+		return MaskToSize(value & ((intx::uint512(1) << (sourceSize * 8)) - 1), destSize);
 }
 
 
-static inline uint64_t GetActualShift(uint64_t value, size_t instrSize)
+static inline intx::uint512 GetActualShift(intx::uint512 value, size_t instrSize)
 {
 	if (instrSize <= 4)
 		return value & 0b11111;
@@ -2734,7 +2949,7 @@ static inline uint64_t GetActualShift(uint64_t value, size_t instrSize)
 }
 
 
-bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::LowLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::LowLevelILInstruction &instr, intx::uint512& value)
 {
 	// We only want to do this check once before the recursion
 	if (!m_state->IsConnected() || m_state->IsRunning())
@@ -2744,16 +2959,13 @@ bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::LowLevelILInstru
 }
 
 
-bool DebuggerController::ComputeExprValue(const LowLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValue(const LowLevelILInstruction &instr, intx::uint512& value)
 {
-	if (instr.size > 8)
+	if (instr.size > 64)
 		return false;
 
-	uint64_t left, right;
-
-	int64_t sizeMask = -1;
-	if (instr.size > 0 && instr.size < 8)
-		sizeMask = (1LL << (instr.size * 8)) - 1;
+	intx::uint512 left, right;
+	intx::uint512 sizeMask = (intx::uint512(1) << (instr.size * 8)) - 1;
 
 	switch (instr.operation)
 	{
@@ -2802,61 +3014,27 @@ bool DebuggerController::ComputeExprValue(const LowLevelILInstruction &instr, ui
 	{
 		if (!ComputeExprValue(instr.GetSourceExpr<LLIL_LOAD>(), left))
 			return false;
-		auto buffer = ReadMemory(left, instr.size);
+		auto buffer = ReadMemory((uint64_t)left, instr.size);
 		if (buffer.GetLength() != instr.size)
 			return false;
 
-		switch (instr.size)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), instr.size);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 	case LLIL_STORE:
 	{
 		if (!ComputeExprValue(instr.GetDestExpr<LLIL_STORE>(), left))
 			return false;
-		auto buffer = ReadMemory(left, instr.size);
+		auto buffer = ReadMemory((uint64_t)left, instr.size);
 		if (buffer.GetLength() != instr.size)
 			return false;
 
-		switch (instr.size)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), instr.size);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 	case LLIL_LSL:
 	{
@@ -2967,27 +3145,10 @@ bool DebuggerController::ComputeExprValue(const LowLevelILInstruction &instr, ui
 		if (buffer.GetLength() != instr.size)
 			return false;
 
-		switch (instr.size)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), instr.size);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 	case LLIL_CMP_E:
 		if (!ComputeExprValue(instr.GetLeftExpr<LLIL_CMP_E>(), left))
@@ -3076,8 +3237,8 @@ bool DebuggerController::ComputeExprValue(const LowLevelILInstruction &instr, ui
 }
 
 
-uint64_t DebuggerController::GetValueFromComparison(const BNLowLevelILOperation op, uint64_t left, uint64_t right,
-	size_t size)
+intx::uint512 DebuggerController::GetValueFromComparison(const BNLowLevelILOperation op, intx::uint512 left,
+	intx::uint512 right, size_t size)
 {
 	switch (op)
 	{
@@ -3088,28 +3249,44 @@ uint64_t DebuggerController::GetValueFromComparison(const BNLowLevelILOperation 
 			return left != right;
 			break;
 		case LLIL_CMP_SLT:
-			return SignExtend(left, size, 8) < SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b);
 			break;
+		}
 		case LLIL_CMP_ULT:
-			return (uint64_t)(left) < (uint64_t)(right);
+			return left < right;
 			break;
 		case LLIL_CMP_SLE:
-			return SignExtend(left, size, 8) <= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b) || (a == b);
 			break;
+		}
 		case LLIL_CMP_ULE:
-			return (uint64_t)(left) <= (uint64_t)(right);
+			return left <= right;
 			break;
 		case LLIL_CMP_SGE:
-			return SignExtend(left, size, 8) >= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !slt(a, b);
 			break;
+		}
 		case LLIL_CMP_UGE:
-			return (uint64_t)(left) >= (uint64_t)(right);
+			return left >= right;
 			break;
 		case LLIL_CMP_SGT:
-			return SignExtend(left, size, 8) > SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !(slt(a, b) || (a == b));
 			break;
+		}
 		case LLIL_CMP_UGT:
-			return (uint64_t)(left) > (uint64_t)(right);
+			return left > right;
 			break;
 		default:
 			break;
@@ -3118,8 +3295,8 @@ uint64_t DebuggerController::GetValueFromComparison(const BNLowLevelILOperation 
 }
 
 
-uint64_t DebuggerController::GetValueFromComparison(const BNMediumLevelILOperation op, uint64_t left, uint64_t right,
-	size_t size)
+intx::uint512 DebuggerController::GetValueFromComparison(const BNMediumLevelILOperation op, intx::uint512 left,
+	intx::uint512 right, size_t size)
 {
 	switch (op)
 	{
@@ -3130,28 +3307,44 @@ uint64_t DebuggerController::GetValueFromComparison(const BNMediumLevelILOperati
 			return left != right;
 			break;
 		case MLIL_CMP_SLT:
-			return SignExtend(left, size, 8) < SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b);
 			break;
+		}
 		case MLIL_CMP_ULT:
-			return (uint64_t)(left) < (uint64_t)(right);
+			return left < right;
 			break;
 		case MLIL_CMP_SLE:
-			return SignExtend(left, size, 8) <= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b) || (a == b);
 			break;
+		}
 		case MLIL_CMP_ULE:
-			return (uint64_t)(left) <= (uint64_t)(right);
+			return left <= right;
 			break;
 		case MLIL_CMP_SGE:
-			return SignExtend(left, size, 8) >= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !slt(a, b);
 			break;
+		}
 		case MLIL_CMP_UGE:
-			return (uint64_t)(left) >= (uint64_t)(right);
+			return left >= right;
 			break;
 		case MLIL_CMP_SGT:
-			return SignExtend(left, size, 8) > SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !(slt(a, b) || (a == b));
 			break;
+		}
 		case MLIL_CMP_UGT:
-			return (uint64_t)(left) > (uint64_t)(right);
+			return left > right;
 			break;
 		default:
 			break;
@@ -3160,8 +3353,8 @@ uint64_t DebuggerController::GetValueFromComparison(const BNMediumLevelILOperati
 }
 
 
-uint64_t DebuggerController::GetValueFromComparison(const BNHighLevelILOperation op, uint64_t left, uint64_t right,
-	size_t size)
+intx::uint512 DebuggerController::GetValueFromComparison(const BNHighLevelILOperation op, intx::uint512 left,
+	intx::uint512 right, size_t size)
 {
 	switch (op)
 	{
@@ -3172,28 +3365,44 @@ uint64_t DebuggerController::GetValueFromComparison(const BNHighLevelILOperation
 			return left != right;
 			break;
 		case HLIL_CMP_SLT:
-			return SignExtend(left, size, 8) < SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b);
 			break;
+		}
 		case HLIL_CMP_ULT:
-			return (uint64_t)(left) < (uint64_t)(right);
+			return left < right;
 			break;
 		case HLIL_CMP_SLE:
-			return SignExtend(left, size, 8) <= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return slt(a, b) || (a == b);
 			break;
+		}
 		case HLIL_CMP_ULE:
-			return (uint64_t)(left) <= (uint64_t)(right);
+			return left <= right;
 			break;
 		case HLIL_CMP_SGE:
-			return SignExtend(left, size, 8) >= SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !slt(a, b);
 			break;
+		}
 		case HLIL_CMP_UGE:
-			return (uint64_t)(left) >= (uint64_t)(right);
+			return left >= right;
 			break;
 		case HLIL_CMP_SGT:
-			return SignExtend(left, size, 8) > SignExtend(right, size, 8);
+		{
+			auto a = SignExtend(left, size, 64);
+			auto b = SignExtend(right, size, 64);
+			return !(slt(a, b) || (a == b));
 			break;
+		}
 		case HLIL_CMP_UGT:
-			return (uint64_t)(left) > (uint64_t)(right);
+			return left > right;
 			break;
 		default:
 			break;
@@ -3202,7 +3411,7 @@ uint64_t DebuggerController::GetValueFromComparison(const BNHighLevelILOperation
 }
 
 
-bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::MediumLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::MediumLevelILInstruction &instr, intx::uint512& value)
 {
 	// We only want to do this check once before the recursion
 	if (!m_state->IsConnected() || m_state->IsRunning())
@@ -3212,16 +3421,13 @@ bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::MediumLevelILIns
 }
 
 
-bool DebuggerController::ComputeExprValue(const MediumLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValue(const MediumLevelILInstruction &instr, intx::uint512& value)
 {
-	if (instr.size > 8)
+	if (instr.size > 64)
 		return false;
 
-	uint64_t left, right;
-
-	int64_t sizeMask = -1;
-	if (instr.size > 0 && instr.size < 8)
-		sizeMask = (1LL << (instr.size * 8)) - 1;
+	intx::uint512 left, right;
+	intx::uint512 sizeMask = (intx::uint512(1) << (instr.size * 8)) - 1;
 
 	switch (instr.operation)
 	{
@@ -3260,61 +3466,27 @@ bool DebuggerController::ComputeExprValue(const MediumLevelILInstruction &instr,
 	{
 		if (!ComputeExprValue(instr.GetSourceExpr<MLIL_LOAD>(), left))
 			return false;
-		auto buffer = ReadMemory(left, instr.size);
+		auto buffer = ReadMemory((uint64_t)left, instr.size);
 		if (buffer.GetLength() != instr.size)
 			return false;
 
-		switch (instr.size)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), instr.size);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 	case MLIL_STORE:
 	{
 		if (!ComputeExprValue(instr.GetDestExpr<MLIL_STORE>(), left))
 			return false;
-		auto buffer = ReadMemory(left, instr.size);
+		auto buffer = ReadMemory((uint64_t)left, instr.size);
 		if (buffer.GetLength() != instr.size)
 			return false;
 
-		switch (instr.size)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), instr.size);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 	case MLIL_LSL:
 	{
@@ -3346,7 +3518,7 @@ bool DebuggerController::ComputeExprValue(const MediumLevelILInstruction &instr,
 			left |= ~sizeMask;
 		else
 			left &= sizeMask;
-		value = ((int64_t)left) >> GetActualShift(right, instr.size);
+		value = left >> GetActualShift(right, instr.size);
 		value &= sizeMask;
 		return true;
 	}
@@ -3496,7 +3668,7 @@ bool DebuggerController::ComputeExprValue(const MediumLevelILInstruction &instr,
 }
 
 
-bool DebuggerController::GetVariableValueAPI(const Variable& var, uint64_t address, size_t size, uint64_t& value)
+bool DebuggerController::GetVariableValueAPI(const Variable& var, uint64_t address, size_t size, intx::uint512& value)
 {
 	// We only want to do this check once before the recursion
 	if (!m_state->IsConnected() || m_state->IsRunning())
@@ -3506,11 +3678,11 @@ bool DebuggerController::GetVariableValueAPI(const Variable& var, uint64_t addre
 }
 
 
-bool DebuggerController::GetVariableValue(const Variable& var, uint64_t address, size_t size, uint64_t &value)
+bool DebuggerController::GetVariableValue(const Variable& var, uint64_t address, size_t size, intx::uint512 &value)
 {
-	int64_t sizeMask = -1;
-	if (size > 0 && size < 8)
-		sizeMask = (1LL << (size * 8)) - 1;
+	intx::uint512 sizeMask = -1;
+	if (size > 0 && size < 64)
+		sizeMask = (intx::uint512(1) << (size * 8)) - 1;
 
 	if (var.type == RegisterVariableSourceType)
 	{
@@ -3552,42 +3724,25 @@ bool DebuggerController::GetVariableValue(const Variable& var, uint64_t address,
 		if (!type)
 			return false;
 
-		auto width = type->GetWidth();
-		if (width > 8)
+		size_t width = type->GetWidth();
+		if (width > 64)
 			return false;
 
 		auto buffer = ReadMemory(addrOfVar, width);
 		if (buffer.GetLength() != width)
 			return false;
 
-		switch (width)
-		{
-		case 1:
-			value = *reinterpret_cast<uint8_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 2:
-			value = *reinterpret_cast<uint16_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 4:
-			value = *reinterpret_cast<uint32_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		case 8:
-			value = *reinterpret_cast<uint64_t*>(buffer.GetData());
-			value &= sizeMask;
-			return true;
-		default:
-			return false;
-		}
+		uint8_t intxBuffer[64] = {};
+		memcpy(intxBuffer, buffer.GetData(), width);
+		value = intx::le::load<intx::uint512>(intxBuffer) & sizeMask;
+		return true;
 	}
 
 	return false;
 }
 
 
-bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::HighLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::HighLevelILInstruction &instr, intx::uint512& value)
 {
 	// We only want to do this check once before the recursion
 	if (!m_state->IsConnected() || m_state->IsRunning())
@@ -3597,16 +3752,13 @@ bool DebuggerController::ComputeExprValueAPI(const BinaryNinja::HighLevelILInstr
 }
 
 
-bool DebuggerController::ComputeExprValue(const HighLevelILInstruction &instr, uint64_t& value)
+bool DebuggerController::ComputeExprValue(const HighLevelILInstruction &instr, intx::uint512& value)
 {
-	if (instr.size > 8)
+	if (instr.size > 64)
 		return false;
 
-	uint64_t left, right;
-
-	int64_t sizeMask = -1;
-	if (instr.size > 0 && instr.size < 8)
-		sizeMask = (1LL << (instr.size * 8)) - 1;
+	intx::uint512 left, right;
+	intx::uint512 sizeMask = (intx::uint512(1) << (instr.size * 8)) - 1;
 
 	switch (instr.operation)
 	{
@@ -3828,4 +3980,32 @@ Ref<Settings> DebuggerController::GetAdapterSettings()
 		return nullptr;
 
 	return m_adapter->GetAdapterSettings();
+}
+
+
+void DebuggerController::SetDebuggerUICallbacks(BNDebuggerUICallbacks* cb, void* ctxt)
+{
+	m_uiCallbacks = std::make_unique<DebuggerUICallbacks>(cb, ctxt);
+}
+
+
+void DebuggerUICallbacks::NotifyRebaseBinaryView(uint64_t remoteBase)
+{
+	if (m_callbacks && m_callbacks->rebaseBinaryView)
+		m_callbacks->rebaseBinaryView(m_context, remoteBase);
+}
+
+
+bool DebuggerController::FunctionExistsInOldView(uint64_t address)
+{
+	if (m_ranges.empty())
+		return false;
+
+	address -= (m_newViewBase - m_oldViewBase);
+	for (const auto& range: m_ranges)
+	{
+		if (address >= range.start && address < range.end)
+			return true;
+	}
+	return false;
 }

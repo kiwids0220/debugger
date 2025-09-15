@@ -301,12 +301,12 @@ DebugModulesWidget::DebugModulesWidget(ViewFrame* view, BinaryViewRef data) : QT
 	QString actionName = QString::fromStdString("Jump To Start");
 	UIAction::registerAction(actionName);
 	m_menu->addAction(actionName, "Options", MENU_ORDER_FIRST);
-	m_actionHandler.bindAction(actionName, UIAction([=]() { jumpToStart(); }));
+	m_actionHandler.bindAction(actionName, UIAction([this]() { jumpToStart(); }));
 
 	actionName = QString::fromStdString("Jump To End");
 	UIAction::registerAction(actionName);
 	m_menu->addAction(actionName, "Options", MENU_ORDER_FIRST);
-	m_actionHandler.bindAction(actionName, UIAction([=]() { jumpToEnd(); }));
+	m_actionHandler.bindAction(actionName, UIAction([this]() { jumpToEnd(); }));
 
 	m_menu->addAction("Copy", "Options", MENU_ORDER_NORMAL);
 	m_actionHandler.bindAction("Copy", UIAction([&]() { copy(); }, [&]() { return canCopy(); }));
@@ -333,20 +333,11 @@ DebugModulesWidget::DebugModulesWidget(ViewFrame* view, BinaryViewRef data) : QT
 	});
 
 	connect(this, &QTableView::doubleClicked, this, &DebugModulesWidget::onDoubleClicked);
+	connect(this, &DebugModulesWidget::debuggerEvent, this, &DebugModulesWidget::onDebuggerEvent);
 
 	m_debuggerEventCallback = m_controller->RegisterEventCallback(
 		[&](const DebuggerEvent& event) {
-			switch (event.type)
-			{
-			case TargetStoppedEventType:
-			case TargetExitedEventType:
-				// These updates ensure the widgets become empty after the target stops
-			case DetachedEventType:
-				updateContent();
-				break;
-			default:
-				break;
-			}
+			emit debuggerEvent(event);
 		},
 		"Modules Widget");
 
@@ -375,6 +366,22 @@ void DebugModulesWidget::notifyModulesChanged(std::vector<DebugModule> modules)
 {
 	m_model->updateRows(modules);
 	updateColumnWidths();
+}
+
+
+void DebugModulesWidget::onDebuggerEvent(const DebuggerEvent& event)
+{
+	switch (event.type)
+	{
+		case TargetStoppedEventType:
+		case TargetExitedEventType:
+			// These updates ensure the widgets become empty after the target stops
+		case DetachedEventType:
+			updateContent();
+			break;
+		default:
+			break;
+	}
 }
 
 
@@ -594,100 +601,19 @@ void DebugModulesWithFilter::updateFonts()
 }
 
 
-GlobalDebugModulesContainer::GlobalDebugModulesContainer(const QString& title) :
-	SidebarWidget(title), m_currentFrame(nullptr), m_consoleStack(new QStackedWidget)
+DebugModulesContainer::DebugModulesContainer(ViewFrame* frame, BinaryViewRef data) : SidebarWidget("Debugger Modules")
 {
+	m_widget = new DebugModulesWithFilter(frame, data);
+
 	auto* layout = new QVBoxLayout(this);
 	layout->setContentsMargins(0, 0, 0, 0);
-	layout->addWidget(m_consoleStack);
-
-	auto* noViewLabel = new QLabel("No active view.");
-	noViewLabel->setStyleSheet("QLabel { background: palette(base); }");
-	noViewLabel->setAlignment(Qt::AlignCenter);
-
-	m_consoleStack->addWidget(noViewLabel);
+	layout->addWidget(m_widget);
 }
 
 
-DebugModulesWithFilter* GlobalDebugModulesContainer::currentWidget() const
+void DebugModulesContainer::notifyFontChanged()
 {
-	if (m_consoleStack->currentIndex() == 0)
-		return nullptr;
-
-	return qobject_cast<DebugModulesWithFilter*>(m_consoleStack->currentWidget());
-}
-
-
-void GlobalDebugModulesContainer::freeWidgetForView(QObject* obj)
-{
-	// A old-style cast must be used here since qobject_cast will fail because
-	// the object is on the brink of deletion.
-	auto* vf = (ViewFrame*)obj;
-
-	// Confirm there is a record of this view.
-	if (!m_widgetMap.count(vf))
-	{
-		LogWarn("Attempted to free DebuggerConsole for untracked view %p", obj);
-		return;
-	}
-
-	auto* console = m_widgetMap[vf];
-	m_consoleStack->removeWidget(console);
-	m_widgetMap.remove(vf);
-
-	// Must be called so the ChatBox is guaranteed to be destoryed. If two
-	// instances for the same view/database exist, things will break.
-	console->deleteLater();
-}
-
-
-void GlobalDebugModulesContainer::notifyViewChanged(ViewFrame* frame)
-{
-	// The "no active view" message widget is always located at index 0. If the
-	// frame passed is nullptr, show it.
-	if (!frame)
-	{
-		m_consoleStack->setCurrentIndex(0);
-		m_currentFrame = nullptr;
-
-		return;
-	}
-
-	// The notifyViewChanged event can fire multiple times for the same frame
-	// even if there is no apparent change. Compare the new frame to the
-	// current one before continuing to avoid unnecessary work.
-	if (frame == m_currentFrame)
-		return;
-	m_currentFrame = frame;
-
-	// Get the appropriate DebuggerConsole for this ViewFrame, or create a new one if it
-	// doesn't yet exist. The default value for non-existent keys of pointer
-	// types in Qt containers is nullptr, which allows this logic below to work.
-	auto* currentConsole = m_widgetMap.value(frame);
-	if (!currentConsole)
-	{
-		currentConsole = new DebugModulesWithFilter(frame, frame->getCurrentBinaryView());
-
-		// DockWidgets related to a ViewFrame are automatically cleaned up as
-		// part of the ViewFrame destructor. To ensure there is never a DebuggerConsole
-		// for a non-existent ViewFrame, the cleanup must be configured manually.
-		connect(frame, &QObject::destroyed, this, &GlobalDebugModulesContainer::freeWidgetForView);
-
-		m_widgetMap.insert(frame, currentConsole);
-		m_consoleStack->addWidget(currentConsole);
-	}
-
-	m_consoleStack->setCurrentWidget(currentConsole);
-}
-
-
-void GlobalDebugModulesContainer::notifyFontChanged()
-{
-	for (auto it = m_widgetMap.begin(); it != m_widgetMap.end(); it++)
-	{
-		if (it.value())
-			it.value()->updateFonts();
-	}
+	m_widget->updateFonts();
 }
 
 
@@ -717,3 +643,15 @@ bool DebugModulesFilterProxyModel::filterAcceptsRow(int sourceRow, const QModelI
 DebugModulesSidebarWidgetType::DebugModulesSidebarWidgetType() :
 	SidebarWidgetType(QImage(":/icons/images/squares-bug.png"), "Debugger Modules")
 {}
+
+
+SidebarWidget* DebugModulesSidebarWidgetType::createWidget(ViewFrame* frame, BinaryViewRef data)
+{
+	return new DebugModulesContainer(frame, data);
+}
+
+
+SidebarContentClassifier* DebugModulesSidebarWidgetType::contentClassifier(ViewFrame*, BinaryViewRef data)
+{
+	return new ActiveDebugSessionSidebarContentClassifier(data);
+}

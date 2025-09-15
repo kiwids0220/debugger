@@ -17,6 +17,12 @@ limitations under the License.
 #pragma once
 #include "dbgengadapter.h"
 
+// Additional includes for TTD memory analysis
+#include <dbgmodel.h>
+#include <comdef.h>
+#include <wrl/client.h>
+using namespace Microsoft::WRL;
+
 namespace BinaryNinjaDebugger {
     class DbgEngTTDAdapter: public DbgEngAdapter
     {
@@ -26,7 +32,7 @@ namespace BinaryNinjaDebugger {
         [[nodiscard]] bool ExecuteWithArgsInternal(const std::string& path, const std::string& args,
            const std::string& workingDir, const LaunchConfigurations& configs = {}) override;
 		bool WriteMemory(std::uintptr_t address, const DataBuffer& buffer) override;
-		bool WriteRegister(const std::string& reg, std::uintptr_t value) override;
+		bool WriteRegister(const std::string& reg, intx::uint512 value) override;
 
 		bool Start() override;
 		void Reset() override;
@@ -40,8 +46,34 @@ namespace BinaryNinjaDebugger {
     	
 		bool Quit() override;
 
+		// TTD Memory Analysis Methods
+		std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType = TTDMemoryRead) override;
+		TTDPosition GetCurrentTTDPosition() override;
+		bool SetTTDPosition(const TTDPosition& position) override;
+
+    	// TTD Calls Analysis Methods
+    	std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0) override;
+
     	void GenerateDefaultAdapterSettings(BinaryView* data);
     	Ref<Settings> GetAdapterSettings() override;
+
+	private:
+		// Helper methods for TTD memory analysis
+		bool QueryMemoryAccessByAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType, std::vector<TTDMemoryEvent>& events);
+		
+		// Helper methods for TTD calls analysis
+		bool QueryCallsForSymbols(const std::vector<std::string>& symbols, uint64_t startReturnAddress, uint64_t endReturnAddress, std::vector<TTDCallEvent>& events);
+		bool ParseTTDCallObjects(const std::string& expression, std::vector<TTDCallEvent>& events);
+
+		// Data model helper methods
+		std::string EvaluateDataModelExpression(const std::string& expression);
+		bool ParseTTDMemoryObjects(const std::string& expression, TTDMemoryAccessType accessType, std::vector<TTDMemoryEvent>& events);
+
+		// Data model interfaces for TTD
+		IHostDataModelAccess* m_dataModelManager;
+    	IDataModelManager* m_modelMgr;
+		IDebugHost* m_debugHost;
+		IDebugHostEvaluator* m_hostEvaluator;
     };
 
     class DbgEngTTDAdapterType : public DebugAdapterType

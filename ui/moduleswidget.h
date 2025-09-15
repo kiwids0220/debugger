@@ -159,6 +159,8 @@ class DebugModulesWidget : public QTableView, public FilterTarget
 	virtual void selectFirstItem() override;
 	virtual void activateFirstItem() override;
 
+	void updateContent();
+
 public:
 	DebugModulesWidget(ViewFrame* view, BinaryViewRef data);
 	~DebugModulesWidget();
@@ -167,6 +169,9 @@ public:
 	void notifyModulesChanged(std::vector<DebugModule> modules);
 	void updateFonts();
 
+signals:
+	void debuggerEvent(const DebuggerEvent& event);
+
 private slots:
 	void jumpToStart();
 	void jumpToEnd();
@@ -174,7 +179,7 @@ private slots:
 	void onDoubleClicked();
 
 public slots:
-	void updateContent();
+	void onDebuggerEvent(const DebuggerEvent& event);
 	void showContextMenu();
 };
 
@@ -194,24 +199,12 @@ public:
 };
 
 
-class GlobalDebugModulesContainer : public SidebarWidget
+class DebugModulesContainer : public SidebarWidget
 {
-	ViewFrame* m_currentFrame;
-	QHash<ViewFrame*, DebugModulesWithFilter*> m_widgetMap;
-
-	QStackedWidget* m_consoleStack;
-
-	//! Get the current active DebuggerConsole. Returns nullptr in the event of an error
-	//! or if there is no active ChatBox.
-	DebugModulesWithFilter* currentWidget() const;
-
-	//! Delete the DebuggerConsole for the given view.
-	void freeWidgetForView(QObject*);
+	DebugModulesWithFilter* m_widget;
 
 public:
-	GlobalDebugModulesContainer(const QString& title);
-
-	void notifyViewChanged(ViewFrame*) override;
+	DebugModulesContainer(ViewFrame* frame, BinaryViewRef data);
 	void notifyFontChanged() override;
 };
 
@@ -220,7 +213,9 @@ class DebugModulesSidebarWidgetType : public SidebarWidgetType
 {
 public:
 	DebugModulesSidebarWidgetType();
+	SidebarWidget* createWidget(ViewFrame* frame, BinaryViewRef data) override;
 	SidebarWidgetLocation defaultLocation() const override { return SidebarWidgetLocation::RightBottom; }
-	SidebarContextSensitivity contextSensitivity() const override { return SelfManagedSidebarContext; }
-	bool hideIfNoContent() const override { return true; }
+	SidebarContextSensitivity contextSensitivity() const override { return PerViewTypeSidebarContext; }
+	SidebarIconVisibility defaultIconVisibility() const override { return HideSidebarIconIfNoContent; }
+	SidebarContentClassifier* contentClassifier(ViewFrame*, BinaryViewRef) override;
 };

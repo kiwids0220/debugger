@@ -57,6 +57,9 @@ public:
 	void SetActiveFrame(ViewFrame* frame);
 
 	void SetupMenu(UIContext* context);
+	void GetAddressRange(const UIActionContext& ctxt, uint64_t& startAddr, uint64_t& endAddr);
+	void QueryTTDMemoryAccess(const UIActionContext& ctxt, uint64_t startAddr, uint64_t endAddr, BNDebuggerTTDMemoryAccessType accessType);
+	void QueryTTDCalls(const UIActionContext& ctxt, const std::string& symbols, uint64_t startReturnAddr = 0, uint64_t endReturnAddr = 0);
 
 	void SetDisplayingGlobalAreaWidgets(bool display);
 };
@@ -71,6 +74,9 @@ private:
 	DbgRef<DebuggerController> m_controller;
 
 	size_t m_eventCallback;
+
+	DebuggerUICallbacks* m_uiCallbacks = nullptr;
+	void checkRebaseBinaryView(uint64_t address);
 
 public:
 	DebuggerUI(UIContext* context, DebuggerControllerRef controller);
@@ -91,4 +97,19 @@ signals:
 
 private slots:
 	void updateUI(const DebuggerEvent& event);
+};
+
+
+class ActiveDebugSessionSidebarContentClassifier : public SidebarContentClassifier
+{
+	Q_OBJECT
+
+	size_t m_eventIndex;
+	SidebarContentClassification m_contentClassification = SidebarHasNoContent;
+	DebuggerControllerRef m_debugger;
+
+public:
+	ActiveDebugSessionSidebarContentClassifier(BinaryViewRef data);
+	~ActiveDebugSessionSidebarContentClassifier() override;
+	SidebarContentClassification contentClassification() override { return m_contentClassification; }
 };

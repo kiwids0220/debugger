@@ -467,6 +467,23 @@ bool EsrevenAdapter::BreakpointExists(uint64_t address) const
                    DebugBreakpoint(address)) != this->m_debugBreakpoints.end();
 }
 
+static intx::uint512 parseLittleEndianHexToUint512(const std::string& hex) {
+	if (hex.size() % 2 != 0)
+		return {};
+
+	uint8_t buffer[64] = {};  // Zero-initialized
+
+	size_t byteCount = hex.size() / 2;
+	size_t limit = std::min(byteCount, size_t(64));
+
+	for (size_t i = 0; i < limit; ++i)
+	{
+		std::string byteStr = hex.substr(i * 2, 2);
+		buffer[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
+	}
+
+	return intx::le::load<intx::uint512>(buffer);
+}
 
 std::unordered_map<std::string, DebugRegister> EsrevenAdapter::ReadAllRegisters()
 {
@@ -499,13 +516,10 @@ std::unordered_map<std::string, DebugRegister> EsrevenAdapter::ReadAllRegisters(
     for ( const auto& [register_name, register_info] : register_info_vec ) {
         const auto number_of_chars = 2 * ( register_info.m_bitSize / 8 );
         const auto value_string = register_info_reply_string.substr(0, number_of_chars);
-        if (number_of_chars <= 0x10 && !value_string.empty()) {
-			size_t size = value_string.length() / 2;
-            const auto value = RspConnector::SwapEndianness(strtoull(value_string.c_str(), nullptr, 16), size);
-            all_regs[register_name] = DebugRegister(register_name, value, register_info.m_bitSize, register_info.m_regNum);
-            // #warning "ignoring registers with a larger size than 0x10"
-            /* TODO: ^fix this^ */
-        }
+    	if (!value_string.empty()) {
+    		intx::uint512 value = parseLittleEndianHexToUint512(value_string);
+    		all_regs[register_name] = DebugRegister(register_name, value, register_info.m_bitSize, register_info.m_regNum);
+    	}
         register_info_reply_string.erase(0, number_of_chars);
     }
 
@@ -524,13 +538,33 @@ DebugRegister EsrevenAdapter::ReadRegister(const std::string& reg)
     return this->ReadAllRegisters()[reg];
 }
 
-bool EsrevenAdapter::WriteRegister(const std::string& reg, std::uintptr_t value)
+static std::string uint512ToLittleEndianHex(const intx::uint512& value, size_t width) {
+	// Truncate to 64 bytes (512 bits max)
+	if (width > 64)
+		width = 64;
+
+	uint8_t buffer[64] = {};
+	intx::le::store(buffer, value);  // Store as little-endian
+
+	std::string result;
+	for (size_t i = 0; i < width; ++i)
+		result += fmt::format("{:02X}", buffer[i]);
+
+	return result;
+}
+
+bool EsrevenAdapter::WriteRegister(const std::string& reg, intx::uint512 value)
 {
     if (m_isTargetRunning || !m_rspConnector)
         return false;
 
-    const auto reply = this->m_rspConnector->TransmitAndReceive(RspData("P{}={:016X}",
-                                       this->m_registerInfo[reg].m_regNum, RspConnector::SwapEndianness(value)));
+	if (!this->m_registerInfo.contains(reg))
+		return false;
+
+	const auto newRegString = uint512ToLittleEndianHex(value, this->m_registerInfo[reg].m_bitSize / 8);
+	const auto reply = this->m_rspConnector->TransmitAndReceive(RspData("P{:02X}={}",
+									   this->m_registerInfo[reg].m_regNum, newRegString));
+
     if (reply.m_data[0])
         return true;
 
@@ -541,7 +575,7 @@ bool EsrevenAdapter::WriteRegister(const std::string& reg, std::uintptr_t value)
 	// TODO: check if this works for aarch64
     const auto first_half = generic_query.AsString().substr(0, 2 * (register_offset / 8));
     const auto second_half = generic_query.AsString().substr(2 * ((register_offset + this->m_registerInfo[reg].m_bitSize) / 8) );
-    const auto payload = "G" + first_half + fmt::format("{:016X}", RspConnector::SwapEndianness(value)) + second_half;
+	const auto payload = "G" + first_half + newRegString + second_half;
 
     if ( this->m_rspConnector->TransmitAndReceive(RspData(payload)).AsString() != "OK" )
         return false;
@@ -808,16 +842,28 @@ DebugStopReason EsrevenAdapter::ResponseHandler(bool notifyStopped)
 		}
 		else if (reply[0] == 'S')
 		{
-			m_isTargetRunning = false;
-			auto reason = SingleStep;
-			if (notifyStopped)
+			// Target stopped with signal (equivalent to T response with no n:r pairs)
+			const auto replyString = reply.AsString();
+			if (replyString.length() >= 3)
 			{
-				DebuggerEvent dbgevt;
-				dbgevt.type = AdapterStoppedEventType;
-				dbgevt.data.targetStoppedData.reason = reason;
-				PostDebuggerEvent(dbgevt);
+				std::string signalString = replyString.substr(1, 2);
+				uint64_t signal = std::stoull(signalString, nullptr, 16);
+				
+				m_isTargetRunning = false;
+				CheckApplyPendingBreakpoints();
+				
+				// Look up the signal using helper function
+				DebugStopReason reason = SignalToDebugStopReason(signal);
+				
+				if (notifyStopped)
+				{
+					DebuggerEvent dbgevt;
+					dbgevt.type = AdapterStoppedEventType;
+					dbgevt.data.targetStoppedData.reason = reason;
+					PostDebuggerEvent(dbgevt);
+				}
+				return reason;
 			}
-			return reason;
 		}
 		else if (reply[0] == 'W')
 		{
@@ -1132,7 +1178,7 @@ uint64_t EsrevenAdapter::GetInstructionOffset()
     else
         ipRegisterName = "pc";
 
-	uint64_t value = this->ReadRegister(ipRegisterName).m_value;
+	uint64_t value = (uint64_t)this->ReadRegister(ipRegisterName).m_value;
     return value;
 }
 
@@ -1149,7 +1195,7 @@ uint64_t EsrevenAdapter::GetStackPointer()
 	else
 		ipRegisterName = "sp";
 
-	uint64_t value = this->ReadRegister(ipRegisterName).m_value;
+	uint64_t value = (uint64_t)this->ReadRegister(ipRegisterName).m_value;
 	return value;
 }
 
@@ -1188,40 +1234,6 @@ void EsrevenAdapter::InvalidateCache()
 
 DebugStopReason EsrevenAdapter::SignalToStopReason(std::unordered_map<std::string, std::uint64_t>& map)
 {
-    static std::unordered_map<std::uint64_t, DebugStopReason> signal_lookup = {
-            {1, DebugStopReason::SignalHup},
-            { 2 , DebugStopReason::SignalInt },
-            { 3 , DebugStopReason::SignalQuit },
-            { 4 , DebugStopReason::IllegalInstruction },
-            { 5 , DebugStopReason::SingleStep },
-            { 6 , DebugStopReason::SignalAbrt },
-            { 7 , DebugStopReason::SignalBux },
-            { 8 , DebugStopReason::Calculation },
-            { 9 , DebugStopReason::SignalKill },
-            { 10, DebugStopReason::SignalUsr1 },
-            { 11, DebugStopReason::AccessViolation },
-            { 12, DebugStopReason::SignalUsr2 },
-            { 13, DebugStopReason::SignalPipe },
-            { 14, DebugStopReason::SignalAlrm },
-            { 15, DebugStopReason::SignalTerm },
-            { 16, DebugStopReason::SignalStkflt },
-            { 17, DebugStopReason::SignalChld },
-            { 18, DebugStopReason::SignalCont },
-            { 19, DebugStopReason::SignalStop },
-            { 20, DebugStopReason::SignalTstp },
-            { 21, DebugStopReason::SignalTtin },
-            { 22, DebugStopReason::SignalTtou },
-            { 23, DebugStopReason::SignalUrg },
-            { 24, DebugStopReason::SignalXcpu },
-            { 25, DebugStopReason::SignalXfsz },
-            { 26, DebugStopReason::SignalVtalrm },
-            { 27, DebugStopReason::SignalProf },
-            { 28, DebugStopReason::SignalWinch },
-            { 29, DebugStopReason::SignalPoll },
-            { 30, DebugStopReason::SignalStkflt },
-            { 31, DebugStopReason::SignalSys },
-    };
-
 	if (map.find("signal") != map.end())
 	{
 		uint64_t signal = map["signal"];
@@ -1229,9 +1241,9 @@ DebugStopReason EsrevenAdapter::SignalToStopReason(std::unordered_map<std::strin
 		{
 			return DebugStopReason::Breakpoint;
 		}
-		else if (signal_lookup.find(signal) != signal_lookup.end())
+		else
 		{
-			return signal_lookup[signal];
+			return SignalToDebugStopReason(signal);
 		}
 	}
 

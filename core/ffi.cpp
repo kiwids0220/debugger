@@ -21,6 +21,7 @@ limitations under the License.
 #include "debuggercontroller.h"
 #include "debuggercommon.h"
 #include "../api/ffi.h"
+#include <map>
 
 using namespace BinaryNinjaDebugger;
 
@@ -136,7 +137,7 @@ bool BNDebuggerIsConnected(BNDebuggerController* controller)
 
 bool BNDebuggerIsConnectedToDebugServer(BNDebuggerController* controller)
 {
-	return controller->object->GetState()->IsConnectedToDebugServer();
+	return controller->object->IsConnectedToDebugServer();
 }
 
 
@@ -339,7 +340,7 @@ BNDebugRegister* BNDebuggerGetRegisters(BNDebuggerController* controller, size_t
 	for (size_t i = 0; i < registers.size(); i++)
 	{
 		results[i].m_name = BNDebuggerAllocString(registers[i].m_name.c_str());
-		results[i].m_value = registers[i].m_value;
+		intx::le::store(results[i].m_value, registers[i].m_value);
 		results[i].m_width = registers[i].m_width;
 		results[i].m_registerIndex = registers[i].m_registerIndex;
 		results[i].m_hint = BNDebuggerAllocString(registers[i].m_hint.c_str());
@@ -360,15 +361,20 @@ void BNDebuggerFreeRegisters(BNDebugRegister* registers, size_t count)
 }
 
 
-bool BNDebuggerSetRegisterValue(BNDebuggerController* controller, const char* name, uint64_t value)
+bool BNDebuggerSetRegisterValue(BNDebuggerController* controller, const char* name, const uint8_t* value)
 {
-	return controller->object->SetRegisterValue(std::string(name), value);
+	uint8_t buffer[64];
+	memcpy(buffer, value, 64);
+	return controller->object->SetRegisterValue(std::string(name), intx::le::load<intx::uint512>(buffer));
 }
 
 
-uint64_t BNDebuggerGetRegisterValue(BNDebuggerController* controller, const char* name)
+void BNDebuggerGetRegisterValue(BNDebuggerController* controller, const char* name, uint8_t* buffer)
 {
-	return controller->object->GetRegisterValue(std::string(name));
+	auto value = controller->object->GetRegisterValue(std::string(name));
+	uint8_t temp[64] = {};
+	intx::le::store(temp, value);
+	memcpy(buffer, temp, 64);
 }
 
 
@@ -957,6 +963,12 @@ uint32_t BNDebuggerGetExitCode(BNDebuggerController* controller)
 }
 
 
+void BNDebuggerSetDebuggerUICallbacks(BNDebuggerController* controller, BNDebuggerUICallbacks* cb, void* ctxt)
+{
+	controller->object->SetDebuggerUICallbacks(cb, ctxt);
+}
+
+
 void BNDebuggerWriteStdin(BNDebuggerController* controller, const char* data, size_t len)
 {
 	controller->object->WriteStdIn(std::string(data, len));
@@ -1006,9 +1018,12 @@ bool BNDebuggerActivateDebugAdapter(BNDebuggerController* controller)
 }
 
 
-char* BNDebuggerGetAddressInformation(BNDebuggerController* controller, uint64_t address)
+char* BNDebuggerGetAddressInformation(BNDebuggerController* controller, uint8_t* buffer)
 {
-	return BNDebuggerAllocString(controller->object->GetAddressInformation(address).c_str());
+	uint8_t temp[64] = {};
+	memcpy(temp, buffer, 64);
+	auto value = intx::le::load<intx::uint512>(temp);
+	return BNDebuggerAllocString(controller->object->GetAddressInformation(value).c_str());
 }
 
 
@@ -1040,6 +1055,172 @@ bool BNDebuggerIsTTD(BNDebuggerController* controller)
 {
 	return controller->object->IsTTD();
 }
+
+
+BNDebuggerTTDMemoryEvent* BNDebuggerGetTTDMemoryAccessForAddress(BNDebuggerController* controller,
+	uint64_t address, uint64_t size, BNDebuggerTTDMemoryAccessType accessType, size_t* count)
+{
+	if (!count)
+		return nullptr;
+		
+	*count = 0;
+	
+	TTDMemoryAccessType type = static_cast<TTDMemoryAccessType>(accessType);
+	auto events = controller->object->GetTTDMemoryAccessForAddress(address, size, type);
+	if (events.empty())
+		return nullptr;
+		
+	*count = events.size();
+	auto result = new BNDebuggerTTDMemoryEvent[events.size()];
+	
+	for (size_t i = 0; i < events.size(); i++)
+	{
+		result[i].eventType = BNAllocString(events[i].eventType.c_str());
+		result[i].threadId = events[i].threadId;
+		result[i].uniqueThreadId = events[i].uniqueThreadId;
+		result[i].timeStart.sequence = events[i].timeStart.sequence;
+		result[i].timeStart.step = events[i].timeStart.step;
+		result[i].timeEnd.sequence = events[i].timeEnd.sequence;
+		result[i].timeEnd.step = events[i].timeEnd.step;
+		result[i].address = events[i].address;
+		result[i].size = events[i].size;
+		result[i].memoryAddress = events[i].memoryAddress;
+		result[i].instructionAddress = events[i].instructionAddress;
+		result[i].value = events[i].value;
+		result[i].accessType = static_cast<BNDebuggerTTDMemoryAccessType>(events[i].accessType);
+	}
+	
+	return result;
+}
+
+BNDebuggerTTDPosition BNDebuggerGetCurrentTTDPosition(BNDebuggerController* controller)
+{
+	auto position = controller->object->GetCurrentTTDPosition();
+	BNDebuggerTTDPosition result;
+	result.sequence = position.sequence;
+	result.step = position.step;
+	return result;
+}
+
+bool BNDebuggerSetTTDPosition(BNDebuggerController* controller, BNDebuggerTTDPosition position)
+{
+	TTDPosition pos(position.sequence, position.step);
+	return controller->object->SetTTDPosition(pos);
+}
+
+void BNDebuggerFreeTTDMemoryEvents(BNDebuggerTTDMemoryEvent* events, size_t count)
+{
+	if (events && count > 0)
+	{
+		// Free strings for each event
+		for (size_t i = 0; i < count; ++i)
+		{
+			if (events[i].eventType)
+			{
+				BNFreeString(events[i].eventType);
+			}
+		}
+		delete[] events;
+	}
+}
+
+
+BNDebuggerTTDCallEvent* BNDebuggerGetTTDCallsForSymbols(BNDebuggerController* controller,
+	const char* symbols, uint64_t startReturnAddress, uint64_t endReturnAddress, size_t* count)
+{
+	if (!count)
+		return nullptr;
+		
+	*count = 0;
+	
+	if (!symbols)
+		return nullptr;
+	
+	std::string symbolsStr(symbols);
+	if (symbolsStr.empty())
+		return nullptr;
+	
+	auto events = controller->object->GetTTDCallsForSymbols(symbolsStr, startReturnAddress, endReturnAddress);
+	if (events.empty())
+		return nullptr;
+	
+	*count = events.size();
+	auto result = new BNDebuggerTTDCallEvent[events.size()];
+	
+	for (size_t i = 0; i < events.size(); ++i)
+	{
+		// Copy string fields
+		result[i].eventType = BNAllocString(events[i].eventType.c_str());
+		result[i].function = BNAllocString(events[i].function.c_str());
+		
+		// Copy primitive fields
+		result[i].threadId = events[i].threadId;
+		result[i].uniqueThreadId = events[i].uniqueThreadId;
+		result[i].functionAddress = events[i].functionAddress;
+		result[i].returnAddress = events[i].returnAddress;
+		result[i].returnValue = events[i].returnValue;
+		result[i].hasReturnValue = events[i].hasReturnValue;
+		
+		// Copy parameters array
+		result[i].parameterCount = events[i].parameters.size();
+		if (result[i].parameterCount > 0)
+		{
+			result[i].parameters = new char*[result[i].parameterCount];
+			for (size_t j = 0; j < result[i].parameterCount; ++j)
+			{
+				result[i].parameters[j] = BNAllocString(events[i].parameters[j].c_str());
+			}
+		}
+		else
+		{
+			result[i].parameters = nullptr;
+		}
+		
+		// Copy TTD positions
+		result[i].timeStart.sequence = events[i].timeStart.sequence;
+		result[i].timeStart.step = events[i].timeStart.step;
+		result[i].timeEnd.sequence = events[i].timeEnd.sequence;
+		result[i].timeEnd.step = events[i].timeEnd.step;
+	}
+	
+	return result;
+}
+
+
+void BNDebuggerFreeTTDCallEvents(BNDebuggerTTDCallEvent* events, size_t count)
+{
+	if (!events || count == 0)
+		return;
+		
+	// Free all strings for each event
+	for (size_t i = 0; i < count; ++i)
+	{
+		if (events[i].eventType)
+		{
+			BNFreeString(events[i].eventType);
+		}
+		if (events[i].function)
+		{
+			BNFreeString(events[i].function);
+		}
+		
+		// Free parameter strings
+		if (events[i].parameters && events[i].parameterCount > 0)
+		{
+			for (size_t j = 0; j < events[i].parameterCount; ++j)
+			{
+				if (events[i].parameters[j])
+				{
+					BNFreeString(events[i].parameters[j]);
+				}
+			}
+			delete[] events[i].parameters;
+		}
+	}
+	
+	delete[] events;
+}
+
 
 
 void BNDebuggerPostDebuggerEvent(BNDebuggerController* controller, BNDebuggerEvent* event)
@@ -1087,36 +1268,64 @@ uint64_t BNDebuggerGetViewFileSegmentsStart(BNDebuggerController* controller)
 
 
 bool BNDebuggerComputeLLILExprValue(BNDebuggerController* controller, BNLowLevelILFunction* function, size_t expr,
-	uint64_t& value)
+	uint8_t* buffer)
 {
 	Ref<LowLevelILFunction> llil = new LowLevelILFunction(BNNewLowLevelILFunctionReference(function));
 	auto instr = llil->GetExpr(expr);
-	return controller->object->ComputeExprValueAPI(instr, value);
+	intx::uint512 value;
+	if (!controller->object->ComputeExprValueAPI(instr, value))
+		return false;
+
+	uint8_t temp[64] = {};
+	intx::le::store(temp, value);
+	memcpy(buffer, temp, 64);
+	return true;
 }
 
 
 bool BNDebuggerComputeMLILExprValue(BNDebuggerController* controller, BNMediumLevelILFunction* function, size_t expr,
-	uint64_t& value)
+	uint8_t* buffer)
 {
 	Ref<MediumLevelILFunction> mlil = new MediumLevelILFunction(BNNewMediumLevelILFunctionReference(function));
 	auto instr = mlil->GetExpr(expr);
-	return controller->object->ComputeExprValueAPI(instr, value);
+	intx::uint512 value;
+	if (!controller->object->ComputeExprValueAPI(instr, value))
+		return false;
+
+	uint8_t temp[64] = {};
+	intx::le::store(temp, value);
+	memcpy(buffer, temp, 64);
+	return true;
 }
 
 
 bool BNDebuggerComputeHLILExprValue(BNDebuggerController* controller, BNHighLevelILFunction* function, size_t expr,
-	uint64_t& value)
+	uint8_t* buffer)
 {
 	Ref<HighLevelILFunction> hlil = new HighLevelILFunction(BNNewHighLevelILFunctionReference(function));
 	auto instr = hlil->GetExpr(expr);
-	return controller->object->ComputeExprValueAPI(instr, value);
+	intx::uint512 value;
+	if (!controller->object->ComputeExprValueAPI(instr, value))
+		return false;
+
+	uint8_t temp[64] = {};
+	intx::le::store(temp, value);
+	memcpy(buffer, temp, 64);
+	return true;
 }
 
 
 bool BNDebuggerGetVariableValue(BNDebuggerController* controller, BNVariable* variable, uint64_t address, size_t size,
-	uint64_t& value)
+	uint8_t* buffer)
 {
-	return controller->object->GetVariableValue(*variable, address, size, value);
+	intx::uint512 value;
+	if (!controller->object->GetVariableValue(*variable, address, size, value))
+		return false;
+
+	uint8_t temp[64] = {};
+	intx::le::store(temp, value);
+	memcpy(buffer, temp, 64);
+	return true;
 }
 
 
@@ -1126,4 +1335,10 @@ BNSettings* BNDebuggerGetAdapterSettings(BNDebuggerController* controller)
 	if (!settings)
 		return nullptr;
 	return BNNewSettingsReference(settings->GetObject());
+}
+
+
+bool BNDebuggerFunctionExistsInOldView(BNDebuggerController* controller, uint64_t address)
+{
+	return controller->object->FunctionExistsInOldView(address);
 }

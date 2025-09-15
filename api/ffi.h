@@ -118,7 +118,7 @@ extern "C"
 	typedef struct BNDebugRegister
 	{
 		char* m_name;
-		uint64_t m_value;
+		uint8_t m_value[64] = {0};
 		size_t m_width;
 		size_t m_registerIndex;
 		char* m_hint;
@@ -262,7 +262,6 @@ extern "C"
 		ThreadStateChangedEvent,
 
 		ForceMemoryCacheUpdateEvent,
-		ModuleLoadedEvent,
 	} BNDebuggerEventType;
 
 
@@ -293,6 +292,52 @@ extern "C"
 	{
 		char* message;
 	} BNStdoutMessageEventData;
+
+
+	// TTD (Time Travel Debugging) structures
+	typedef enum BNDebuggerTTDMemoryAccessType
+	{
+		BNDebuggerTTDMemoryRead = 1,
+		BNDebuggerTTDMemoryWrite = 2,
+		BNDebuggerTTDMemoryExecute = 4
+	} BNDebuggerTTDMemoryAccessType;
+
+	typedef struct BNDebuggerTTDPosition
+	{
+		uint64_t sequence;
+		uint64_t step;
+	} BNDebuggerTTDPosition;
+
+	typedef struct BNDebuggerTTDMemoryEvent
+	{
+		char* eventType;
+		uint32_t threadId;
+		uint32_t uniqueThreadId;
+		BNDebuggerTTDPosition timeStart;
+		BNDebuggerTTDPosition timeEnd;
+		uint64_t address;
+		uint64_t size;
+		uint64_t memoryAddress;
+		uint64_t instructionAddress; // IP field
+		uint64_t value; // Value field - the value that was read/written/executed
+		BNDebuggerTTDMemoryAccessType accessType;
+	} BNDebuggerTTDMemoryEvent;
+
+	typedef struct BNDebuggerTTDCallEvent
+	{
+		char* eventType;              // Event type (always "Call" for TTD.Calls objects)
+		uint32_t threadId;            // OS thread ID of thread that made the call
+		uint32_t uniqueThreadId;      // Unique ID for the thread across the trace
+		char* function;               // Symbolic name of the function
+		uint64_t functionAddress;     // Function's address in memory
+		uint64_t returnAddress;       // Instruction to return to after the call
+		uint64_t returnValue;         // Return value of the function (if not void)
+		bool hasReturnValue;          // Whether the function has a return value
+		char** parameters;            // Array containing parameters passed to the function
+		size_t parameterCount;        // Number of parameters
+		BNDebuggerTTDPosition timeStart; // Position when call started
+		BNDebuggerTTDPosition timeEnd;   // Position when call ended
+	} BNDebuggerTTDCallEvent;
 
 
 	// This should really be a union, but gcc complains...
@@ -331,6 +376,10 @@ extern "C"
     	DebugAdapterStepReturnReverse,
     } BNDebuggerAdapterOperation;
 
+	typedef struct BNDebuggerUICallbacks
+	{
+		void (*rebaseBinaryView)(void* ctxt, uint64_t newBase);
+	}BNDebuggerUICallbacks;
 
 	DEBUGGER_FFI_API char* BNDebuggerAllocString(const char* string);
 	DEBUGGER_FFI_API char** BNDebuggerAllocStringList(const char** stringList, size_t count);
@@ -380,8 +429,9 @@ extern "C"
 	DEBUGGER_FFI_API BNDebugRegister* BNDebuggerGetRegisters(BNDebuggerController* controller, size_t* count);
 	DEBUGGER_FFI_API void BNDebuggerFreeRegisters(BNDebugRegister* modules, size_t count);
 	DEBUGGER_FFI_API bool BNDebuggerSetRegisterValue(
-		BNDebuggerController* controller, const char* name, uint64_t value);
-	DEBUGGER_FFI_API uint64_t BNDebuggerGetRegisterValue(BNDebuggerController* controller, const char* name);
+		BNDebuggerController* controller, const char* name, const uint8_t* value);
+	DEBUGGER_FFI_API void BNDebuggerGetRegisterValue(BNDebuggerController* controller, const char* name,
+		uint8_t* buffer);
 
 	// target control
 	DEBUGGER_FFI_API bool BNDebuggerLaunch(BNDebuggerController* controller);
@@ -488,13 +538,23 @@ extern "C"
 
 	DEBUGGER_FFI_API bool BNDebuggerActivateDebugAdapter(BNDebuggerController* controller);
 
-	DEBUGGER_FFI_API char* BNDebuggerGetAddressInformation(BNDebuggerController* controller, uint64_t address);
+	DEBUGGER_FFI_API char* BNDebuggerGetAddressInformation(BNDebuggerController* controller, uint8_t* value);
 	DEBUGGER_FFI_API bool BNDebuggerIsFirstLaunch(BNDebuggerController* controller);
 	DEBUGGER_FFI_API bool BNDebuggerIsFirstConnect(BNDebuggerController* controller);
 	DEBUGGER_FFI_API bool BNDebuggerIsFirstConnectToDebugServer(BNDebuggerController* controller);
 	DEBUGGER_FFI_API bool BNDebuggerIsFirstAttach(BNDebuggerController* controller);
 
 	DEBUGGER_FFI_API bool BNDebuggerIsTTD(BNDebuggerController* controller);
+
+	// TTD Memory Analysis Functions
+	DEBUGGER_FFI_API BNDebuggerTTDMemoryEvent* BNDebuggerGetTTDMemoryAccessForAddress(BNDebuggerController* controller,
+		uint64_t address, uint64_t size, BNDebuggerTTDMemoryAccessType accessType, size_t* count);
+	DEBUGGER_FFI_API BNDebuggerTTDCallEvent* BNDebuggerGetTTDCallsForSymbols(BNDebuggerController* controller,
+		const char* symbols, uint64_t startReturnAddress, uint64_t endReturnAddress, size_t* count);
+	DEBUGGER_FFI_API BNDebuggerTTDPosition BNDebuggerGetCurrentTTDPosition(BNDebuggerController* controller);
+	DEBUGGER_FFI_API bool BNDebuggerSetTTDPosition(BNDebuggerController* controller, BNDebuggerTTDPosition position);
+	DEBUGGER_FFI_API void BNDebuggerFreeTTDMemoryEvents(BNDebuggerTTDMemoryEvent* events, size_t count);
+	DEBUGGER_FFI_API void BNDebuggerFreeTTDCallEvents(BNDebuggerTTDCallEvent* events, size_t count);
 
 	DEBUGGER_FFI_API void BNDebuggerPostDebuggerEvent(BNDebuggerController* controller, BNDebuggerEvent* event);
 
@@ -519,21 +579,26 @@ extern "C"
 		void (*callback)(void* ctx, BNDebuggerEvent* event), const char* name, void* ctx);
 	DEBUGGER_FFI_API void BNDebuggerRemoveEventCallback(BNDebuggerController* controller, size_t index);
 
+	DEBUGGER_FFI_API void BNDebuggerSetDebuggerUICallbacks(BNDebuggerController* controller,
+		BNDebuggerUICallbacks* cb, void* ctx);
+
 	DEBUGGER_FFI_API BNMetadata* BNDebuggerGetAdapterProperty(BNDebuggerController* controller, const char* name);
 	DEBUGGER_FFI_API bool BNDebuggerSetAdapterProperty(
 		BNDebuggerController* controller, const char* name, BNMetadata* value);
 
 	// Compute expression values
 	DEBUGGER_FFI_API bool BNDebuggerComputeLLILExprValue(BNDebuggerController* controller,
-		 BNLowLevelILFunction* function, size_t expr, uint64_t& value);
+		 BNLowLevelILFunction* function, size_t expr, uint8_t* buffer);
 	DEBUGGER_FFI_API bool BNDebuggerComputeMLILExprValue(BNDebuggerController* controller,
-		 BNMediumLevelILFunction* function, size_t expr, uint64_t& value);
+		 BNMediumLevelILFunction* function, size_t expr, uint8_t* buffer);
 	DEBUGGER_FFI_API bool BNDebuggerComputeHLILExprValue(BNDebuggerController* controller,
-		 BNHighLevelILFunction* function, size_t expr, uint64_t& value);
+		 BNHighLevelILFunction* function, size_t expr, uint8_t* buffer);
 	DEBUGGER_FFI_API bool BNDebuggerGetVariableValue(BNDebuggerController* controller,
-		BNVariable* variable, uint64_t address, size_t size, uint64_t& value);
+		BNVariable* variable, uint64_t address, size_t size, uint8_t* buffer);
 
 	DEBUGGER_FFI_API BNSettings* BNDebuggerGetAdapterSettings(BNDebuggerController* controller);
+
+	DEBUGGER_FFI_API bool BNDebuggerFunctionExistsInOldView(BNDebuggerController* controller, uint64_t address);
 
 #ifdef __cplusplus
 }

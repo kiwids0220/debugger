@@ -18,12 +18,14 @@ limitations under the License.
 #include <filesystem>
 #include "lldbadapter.h"
 #include "thread"
+#include "../../vendor/intx/intx.hpp"
+#include "../debuggercontroller.h"
 
 using namespace lldb;
 using namespace BinaryNinjaDebugger;
 using namespace std;
 
-std::string lldbArchNameForBinaryNinjaArchName(std::string name)
+static std::string lldbArchNameForBinaryNinjaArchName(std::string name)
 {
 	if (name == "x86")
 		return "x86";
@@ -285,6 +287,24 @@ Ref<Settings> LldbAdapterType::RegisterAdapterSettings()
 			"readOnly" : false
 			})");
 
+	settings->RegisterSetting("common.followForkMode",
+		R"({
+        "title": "Follow Fork Mode",
+        "type": "string",
+        "enum": ["default", "parent", "child"],
+        "default": "default",
+        "description": "Determines which process to follow when a fork occurs",
+        "readOnly": false
+    })");
+	settings->RegisterSetting("common.initialLLDBCommand",
+	R"({
+        "title": "Initial LLDB Command",
+        "type": "string",
+        "default": "",
+        "description": "Specifies an LLDB command to execute immediately after launching/attaching/connecting to the target",
+        "readOnly": false
+    })");
+
 	return settings;
 }
 
@@ -369,6 +389,10 @@ bool LldbAdapter::ExecuteWithArgs(const std::string& path, const std::string& ar
 	auto redirectStderr = adapterSettings->Get<std::string>("launch.redirectStderr", data, &scope);
 	scope = SettingsResourceScope;
 	auto envVariables = adapterSettings->Get<vector<string>>("launch.environmentVariables", data, &scope);
+	scope = SettingsResourceScope;
+	auto followForkMode = adapterSettings->Get<std::string>("common.followForkMode", data, &scope);
+	scope = SettingsResourceScope;
+	auto initialLLDBCommand = adapterSettings->Get<std::string>("common.initialLLDBCommand", data, &scope);
 
 	CreateTarget(inputFile);
 
@@ -395,13 +419,19 @@ bool LldbAdapter::ExecuteWithArgs(const std::string& path, const std::string& ar
 
 	// TODO: the adapter should record whether it is connected to a debug server itself, rather than relying on the
 	// info from the configs dict
-	if (configs.connectedToDebugServer)
+	if (GetController()->IsConnectedToDebugServer())
 	{
 		// During remote debugging. lldb will try to upload the samples to the working directory before launching.
 		// The working directory defaults to the path the lldb-server is in, which is likely not the intended one.
 		// Here we set the remote working directory to the one specified by the user
 		auto result = InvokeBackendCommand(fmt::format("platform settings -w \"{}\"", workingDirectory));
 	}
+
+	if (followForkMode != "default")
+		InvokeBackendCommand(fmt::format("settings set target.process.follow-fork-mode \"{}\"", followForkMode));
+
+	if (!initialLLDBCommand.empty())
+		InvokeBackendCommand(initialLLDBCommand);
 
 	std::string launchCommand = "process launch";
 	if (Settings::Instance()->Get<bool>("debugger.stopAtSystemEntryPoint") ||
@@ -478,6 +508,10 @@ bool LldbAdapter::Attach(std::uint32_t pid)
 	auto inputFile = adapterSettings->Get<std::string>("common.inputFile", data, &scope);
 	scope = SettingsResourceScope;
 	auto attachPID = adapterSettings->Get<uint64_t>("attach.pid", data, &scope);
+	scope = SettingsResourceScope;
+	auto followForkMode = adapterSettings->Get<std::string>("common.followForkMode", data, &scope);
+	scope = SettingsResourceScope;
+	auto initialLLDBCommand = adapterSettings->Get<std::string>("common.initialLLDBCommand", data, &scope);
 
 	CreateTarget(inputFile);
 
@@ -494,6 +528,12 @@ bool LldbAdapter::Attach(std::uint32_t pid)
 
 	m_targetActive = true;
 	ApplyBreakpoints();
+
+	if (followForkMode != "default")
+		InvokeBackendCommand(fmt::format("settings set target.process.follow-fork-mode \"{}\"", followForkMode));
+
+	if (!initialLLDBCommand.empty())
+		InvokeBackendCommand(initialLLDBCommand);
 
 	SBAttachInfo info(attachPID);
 	m_process = m_target.Attach(info, err);
@@ -571,6 +611,10 @@ bool LldbAdapter::Connect(const std::string& server, std::uint32_t port)
 	auto serverPort = adapterSettings->Get<uint64_t>("connect.port", data, &scope);
 	scope = SettingsResourceScope;
 	auto processPlugin = adapterSettings->Get<std::string>("connect.processPlugin", data, &scope);
+	scope = SettingsResourceScope;
+	auto followForkMode = adapterSettings->Get<std::string>("common.followForkMode", data, &scope);
+	scope = SettingsResourceScope;
+	auto initialLLDBCommand = adapterSettings->Get<std::string>("common.initialLLDBCommand", data, &scope);
 
 	CreateTarget(inputFile);
 
@@ -587,6 +631,12 @@ bool LldbAdapter::Connect(const std::string& server, std::uint32_t port)
 
 	m_targetActive = true;
 	ApplyBreakpoints();
+
+	if (followForkMode != "default")
+		InvokeBackendCommand(fmt::format("settings set target.process.follow-fork-mode \"{}\"", followForkMode));
+
+	if (!initialLLDBCommand.empty())
+		InvokeBackendCommand(initialLLDBCommand);
 
 	if (Settings::Instance()->Get<bool>("debugger.stopAtEntryPoint") && m_hasEntryFunction)
 		AddBreakpoint(ModuleNameAndOffset(inputFile, m_entryPoint - m_start));
@@ -912,6 +962,37 @@ std::vector<DebugBreakpoint> LldbAdapter::GetBreakpointList() const
 }
 
 
+static intx::uint512 SBValueToUint512(lldb::SBValue& reg_val) {
+	using namespace lldb;
+	using namespace intx;
+
+	const intx::uint512 error_value = ~intx::uint512{0};
+
+	if (!reg_val.IsValid())
+		return error_value;
+
+	size_t size = reg_val.GetByteSize();
+	if (size == 0 || size > 64)
+		return error_value;
+
+	// Fast path for small registers
+	if (size <= 8)
+		return intx::uint512{reg_val.GetValueAsUnsigned(0)};
+
+	// Wide registers: read raw bytes
+	SBData data = reg_val.GetData();
+	if (!data.IsValid() || data.GetByteSize() != size)
+		return error_value;
+
+	uint8_t buffer[64] = {};
+	SBError error;
+	if (!data.ReadRawData(error, 0, buffer, size))
+		return error_value;
+
+	return le::load<intx::uint512>(buffer);
+}
+
+
 std::unordered_map<std::string, DebugRegister> LldbAdapter::ReadAllRegisters()
 {
 	std::unordered_map<std::string, DebugRegister> result;
@@ -951,7 +1032,7 @@ std::unordered_map<std::string, DebugRegister> LldbAdapter::ReadAllRegisters()
 			{
 				std::string regName(regNameStr);
 				if (!regName.empty())
-					result[regName] = DebugRegister(regName, reg.GetValueAsUnsigned(), reg.GetByteSize() * 8, regIndex++);
+					result[regName] = DebugRegister(regName, SBValueToUint512(reg), reg.GetByteSize() * 8, regIndex++);
 			}
 		}
 	}
@@ -986,39 +1067,65 @@ DebugRegister LldbAdapter::ReadRegister(const std::string& name)
 			SBValue reg = regGroupInfo.GetChildAtIndex(j);
 			if (name == reg.GetName())
 				// TODO: register width and internal index
-				return DebugRegister(name, reg.GetValueAsUnsigned(), 0, 0);
+				return DebugRegister(name, SBValueToUint512(reg), 0, 0);
 		}
 	}
 	return result;
 }
 
 
-bool LldbAdapter::WriteRegister(const std::string& name, std::uintptr_t value)
+// Helper function to convert a register value to a string recognized by LLDB
+static std::string RegisterValueToLLDBString(const intx::uint512& value, SBValue& reg)
 {
-	//	SBThread thread = m_process.GetSelectedThread();
-	//	if (!thread.IsValid())
-	//		return false;
-	//
-	//	size_t frameCount = thread.GetNumFrames();
-	//	if (frameCount == 0)
-	//		return false;
-	//
-	//	SBFrame frame = thread.GetFrameAtIndex(0);
-	//	if (!frame.IsValid())
-	//		return false;
-	//
-	//	SBValue reg = frame.FindRegister(name.c_str());
-	//	if (!reg.IsValid())
-	//		return false;
-	//
-	//	SBError error;
-	//	bool ok = reg.SetValueFromCString(fmt::format("{}", value).c_str(), error);
-	//	return ok && error.Success();
+	size_t size = reg.GetByteSize();
+	if (size == 0 || size > 64)
+		return {};
+
+	// If the register size is less than or equal to 8 bytes
+	if (size <= 8)
+		return fmt::format("0x{:x}", (uint64_t)value);
+
+	// Handle values larger than 8 bytes
+	// Example: {0x02 0x29 0x02 0x3c 0x02 0x4f 0x02 0x62 0x02 0x75 0x02 0x98 0x04 0x32 0x04 0x45}
+	uint8_t buffer[64] = {};
+	intx::le::store(buffer, value);
+	string result = "{";
+	for (size_t i = 0; i < size; ++i)
+	{
+		result += fmt::format("0x{:x} ", buffer[i]);
+	}
+	result += "}";
+
+	return result;
+}
+
+
+bool LldbAdapter::WriteRegister(const std::string& name, intx::uint512 value)
+{
+		SBThread thread = m_process.GetSelectedThread();
+		if (!thread.IsValid())
+			return false;
+
+		size_t frameCount = thread.GetNumFrames();
+		if (frameCount == 0)
+			return false;
+
+		SBFrame frame = thread.GetFrameAtIndex(0);
+		if (!frame.IsValid())
+			return false;
+
+		SBValue reg = frame.FindRegister(name.c_str());
+		if (!reg.IsValid())
+			return false;
 
 	//	An LLDB bug forces the use of a command rather than the above code via API. When one tries to update the pc
 	//  value using the API, the GetInstructionOffset() function will still return the old value, making the current
 	//  instruction highlight inaccurate.
-	auto command = fmt::format("reg write {} 0x{:x}", name, value);
+	//	SBError error;
+	//	bool ok = reg.SetValueFromCString(fmt::format("{}", value).c_str(), error);
+	//	return ok && error.Success();
+
+	auto command = fmt::format("reg write {} \"{}\"", name, RegisterValueToLLDBString(value, reg));
 	auto result = InvokeBackendCommand(command);
 	if ((result.rfind("error: ", 0) == 0))
 		return false;

@@ -12,15 +12,16 @@ if(NOT BN_INTERNAL_BUILD)
 	add_subdirectory(${BN_API_PATH} ${PROJECT_BINARY_DIR}/api)
 endif()
 
-file(GLOB COMMON_SOURCES
+file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
     *.cpp
     *.h
     ../vendor/pugixml/*.cpp
     ../vendor/pugixml/*.hpp
     ../vendor/fmt/*.h
+	../vendor/intx/intx.hpp
     )
 
-file(GLOB ADAPTER_SOURCES
+file(GLOB ADAPTER_SOURCES CONFIGURE_DEPENDS
 		adapters/lldbadapter.cpp
 		adapters/lldbadapter.h
 		adapters/gdbadapter.cpp
@@ -31,6 +32,8 @@ file(GLOB ADAPTER_SOURCES
 		adapters/corelliumadapter.h
 		adapters/esrevenadapter.cpp
 		adapters/esrevenadapter.h
+		adapters/lldbcoredumpadapter.cpp
+		adapters/lldbcoredumpadapter.h
 	)
 
 if(WIN32)
@@ -64,7 +67,7 @@ if(WIN32)
 endif()
 
 set_target_properties(debuggercore PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 20
 	CXX_VISIBILITY_PRESET hidden
 	CXX_STANDARD_REQUIRED ON
     VISIBILITY_INLINES_HIDDEN ON
