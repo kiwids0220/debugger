@@ -23,6 +23,39 @@ from .debugger_enums import *
 from typing import Callable, List, Union
 
 
+# TTD (Time Travel Debugging) Memory Access Type parsing
+def parse_ttd_access_type(access_spec):
+    """
+    Parse TTD memory access type from string specification.
+    
+    Args:
+        access_spec: String containing access type specification.
+                     Can be combinations of 'r' (read), 'w' (write), 'e' (execute)
+                     e.g., "r", "rw", "rwe", "we", etc.
+                     
+    Returns:
+        DebuggerTTDMemoryAccessType enum value
+    """
+    if isinstance(access_spec, str):
+        access_value = 0
+        access_spec = access_spec.lower()
+        
+        if 'r' in access_spec:
+            access_value |= DebuggerTTDMemoryAccessType.DebuggerTTDMemoryRead
+        if 'w' in access_spec:
+            access_value |= DebuggerTTDMemoryAccessType.DebuggerTTDMemoryWrite
+        if 'e' in access_spec:
+            access_value |= DebuggerTTDMemoryAccessType.DebuggerTTDMemoryExecute
+            
+        if access_value == 0:
+            raise ValueError(f"Invalid access type specification: '{access_spec}'. Use combinations of 'r', 'w', 'e'")
+            
+        return access_value
+    else:
+        # Assume it's already a DebuggerTTDMemoryAccessType enum value
+        return access_spec
+
+
 class DebugProcess:
     """
     DebugProcess represents a process in the target. It has the following fields:
@@ -227,7 +260,7 @@ class DebugBreakpoint:
     * ``module``: the name of the module for which the breakpoint is in
     * ``offset``: the offset of the breakpoint to the start of the module
     * ``address``: the absolute address of the breakpoint
-    * ``enabled``: not used
+    * ``enabled``: whether the breakpoint is enabled (read-only)
 
     """
     def __init__(self, module, offset, address, enabled):
@@ -248,7 +281,7 @@ class DebugBreakpoint:
         return not (self == other)
 
     def __hash__(self):
-        return hash((self.module, self.offset, self.address. self.enabled))
+        return hash((self.module, self.offset, self.address, self.enabled))
 
     def __setattr__(self, name, value):
         try:
@@ -257,7 +290,8 @@ class DebugBreakpoint:
             raise AttributeError(f"attribute '{name}' is read only")
 
     def __repr__(self):
-        return f"<DebugBreakpoint: {self.module}:{self.offset:#x}, {self.address:#x}>"
+        status = "enabled" if self.enabled else "disabled"
+        return f"<DebugBreakpoint: {self.module}:{self.offset:#x}, {self.address:#x}, {status}>"
 
 
 class ModuleNameAndOffset:
@@ -492,6 +526,425 @@ class DebuggerEventWrapper:
             callback(event)
         except:
             binaryninja.log_error(traceback.format_exc())
+
+
+class TTDPosition:
+    """
+    TTDPosition represents a position in a time travel debugging trace.
+    
+    It has the following fields:
+    
+    * ``sequence``: the sequence number (as hex string or int)
+    * ``step``: the step number within the sequence (as hex string or int)
+    """
+    
+    def __init__(self, sequence, step):
+        if isinstance(sequence, str):
+            self.sequence = int(sequence, 16)
+        else:
+            self.sequence = int(sequence)
+            
+        if isinstance(step, str):
+            self.step = int(step, 16)
+        else:
+            self.step = int(step)
+    
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return self.sequence == other.sequence and self.step == other.step
+    
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+    
+    def __hash__(self):
+        return hash((self.sequence, self.step))
+    
+    def __repr__(self):
+        return f"<TTDPosition: {self.sequence:x}:{self.step:x}>"
+    
+    def __str__(self):
+        return f"{self.sequence:x}:{self.step:x}"
+    
+    @classmethod
+    def from_string(cls, timestamp_str):
+        """
+        Create a TTDPosition from a string in format "sequence:step"
+        Both sequence and step can be in hex or decimal format.
+        """
+        if ':' not in timestamp_str:
+            raise ValueError("Timestamp must be in format 'sequence:step'")
+        
+        parts = timestamp_str.strip().split(':')
+        if len(parts) != 2:
+            raise ValueError("Timestamp must be in format 'sequence:step'")
+        
+        return cls(parts[0], parts[1])
+
+
+class TTDMemoryEvent:
+    """
+    TTDMemoryEvent represents a memory access event in a TTD trace. It has the following fields:
+
+    * ``event_type``: type of the event (e.g., "Memory")
+    * ``thread_id``: OS thread ID that performed the memory access
+    * ``unique_thread_id``: unique thread ID across the trace
+    * ``time_start``: TTD position when the memory access started
+    * ``time_end``: TTD position when the memory access ended
+    * ``address``: memory address that was accessed
+    * ``size``: size of the memory access
+    * ``memory_address``: actual memory address (may differ from address field)
+    * ``instruction_address``: address of the instruction that performed the access
+    * ``value``: value that was read/written/executed
+    * ``access_type``: type of access (read/write/execute)
+    """
+
+    def __init__(self, event_type: str, thread_id: int, unique_thread_id: int,
+                 time_start: TTDPosition, time_end: TTDPosition, address: int,
+                 size: int, memory_address: int, instruction_address: int,
+                 value: int, access_type: int):
+        self.event_type = event_type
+        self.thread_id = thread_id
+        self.unique_thread_id = unique_thread_id
+        self.time_start = time_start
+        self.time_end = time_end
+        self.address = address
+        self.size = size
+        self.memory_address = memory_address
+        self.instruction_address = instruction_address
+        self.value = value
+        self.access_type = access_type
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.event_type == other.event_type and
+                self.thread_id == other.thread_id and
+                self.unique_thread_id == other.unique_thread_id and
+                self.time_start == other.time_start and
+                self.time_end == other.time_end and
+                self.address == other.address and
+                self.size == other.size and
+                self.memory_address == other.memory_address and
+                self.instruction_address == other.instruction_address and
+                self.value == other.value and
+                self.access_type == other.access_type)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.event_type, self.thread_id, self.unique_thread_id,
+                     self.time_start, self.time_end, self.address, self.size,
+                     self.memory_address, self.instruction_address, self.value,
+                     self.access_type))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        return f"<TTDMemoryEvent: {self.event_type} @ {self.address:#x}, thread {self.thread_id}>"
+
+
+class TTDCallEvent:
+    """
+    TTDCallEvent represents a function call event in a TTD trace. It has the following fields:
+
+    * ``event_type``: type of the event (always "Call" for TTD.Calls objects)
+    * ``thread_id``: OS thread ID that made the call
+    * ``unique_thread_id``: unique thread ID across the trace
+    * ``function``: symbolic name of the function
+    * ``function_address``: function's address in memory
+    * ``return_address``: instruction to return to after the call
+    * ``return_value``: return value of the function (if not void)
+    * ``has_return_value``: whether the function has a return value
+    * ``parameters``: list of parameters passed to the function
+    * ``time_start``: TTD position when call started
+    * ``time_end``: TTD position when call ended
+    """
+
+    def __init__(self, event_type: str, thread_id: int, unique_thread_id: int,
+                 function: str, function_address: int, return_address: int,
+                 return_value: int, has_return_value: bool, parameters: List[str],
+                 time_start: TTDPosition, time_end: TTDPosition):
+        self.event_type = event_type
+        self.thread_id = thread_id
+        self.unique_thread_id = unique_thread_id
+        self.function = function
+        self.function_address = function_address
+        self.return_address = return_address
+        self.return_value = return_value
+        self.has_return_value = has_return_value
+        self.parameters = parameters
+        self.time_start = time_start
+        self.time_end = time_end
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.event_type == other.event_type and
+                self.thread_id == other.thread_id and
+                self.unique_thread_id == other.unique_thread_id and
+                self.function == other.function and
+                self.function_address == other.function_address and
+                self.return_address == other.return_address and
+                self.return_value == other.return_value and
+                self.has_return_value == other.has_return_value and
+                self.parameters == other.parameters and
+                self.time_start == other.time_start and
+                self.time_end == other.time_end)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.event_type, self.thread_id, self.unique_thread_id,
+                     self.function, self.function_address, self.return_address,
+                     self.return_value, self.has_return_value, tuple(self.parameters),
+                     self.time_start, self.time_end))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        return f"<TTDCallEvent: {self.function} @ {self.function_address:#x}, thread {self.thread_id}>"
+
+
+class TTDEventType:
+    """
+    TTD Event Type enumeration for different types of events in TTD traces.
+    These are bitfield flags that can be combined.
+    """
+    NONE = 0
+    ThreadCreated = 1
+    ThreadTerminated = 2
+    ModuleLoaded = 4
+    ModuleUnloaded = 8
+    Exception = 16
+    ALL = ThreadCreated | ThreadTerminated | ModuleLoaded | ModuleUnloaded | Exception
+
+
+class TTDModule:
+    """
+    TTDModule represents information about modules that were loaded/unloaded during a TTD trace.
+    
+    Attributes:
+        name (str): name and path of the module
+        address (int): address where the module was loaded
+        size (int): size of the module in bytes
+        checksum (int): checksum of the module
+        timestamp (int): timestamp of the module
+    """
+
+    def __init__(self, name: str, address: int, size: int, checksum: int, timestamp: int):
+        self.name = name
+        self.address = address
+        self.size = size
+        self.checksum = checksum
+        self.timestamp = timestamp
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.name == other.name and
+                self.address == other.address and
+                self.size == other.size and
+                self.checksum == other.checksum and
+                self.timestamp == other.timestamp)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.name, self.address, self.size, self.checksum, self.timestamp))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        return f"<TTDModule: {self.name} @ {self.address:#x}, size {self.size}>"
+
+
+class TTDThread:
+    """
+    TTDThread represents information about threads and their lifetime during a TTD trace.
+    
+    Attributes:
+        unique_id (int): unique ID for the thread across the trace
+        id (int): TID of the thread
+        lifetime_start (TTDPosition): lifetime start position
+        lifetime_end (TTDPosition): lifetime end position
+        active_time_start (TTDPosition): active time start position
+        active_time_end (TTDPosition): active time end position
+    """
+
+    def __init__(self, unique_id: int, id: int, lifetime_start: TTDPosition, lifetime_end: TTDPosition,
+                 active_time_start: TTDPosition, active_time_end: TTDPosition):
+        self.unique_id = unique_id
+        self.id = id
+        self.lifetime_start = lifetime_start
+        self.lifetime_end = lifetime_end
+        self.active_time_start = active_time_start
+        self.active_time_end = active_time_end
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.unique_id == other.unique_id and
+                self.id == other.id and
+                self.lifetime_start == other.lifetime_start and
+                self.lifetime_end == other.lifetime_end and
+                self.active_time_start == other.active_time_start and
+                self.active_time_end == other.active_time_end)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.unique_id, self.id, self.lifetime_start, self.lifetime_end,
+                     self.active_time_start, self.active_time_end))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        return f"<TTDThread: TID {self.id}, UniqueID {self.unique_id}>"
+
+
+class TTDExceptionType:
+    """
+    TTD Exception Type enumeration for different types of exceptions.
+    """
+    Software = 0
+    Hardware = 1
+
+
+class TTDException:
+    """
+    TTDException represents information about exceptions that occurred during a TTD trace.
+    
+    Attributes:
+        type (int): type of exception (TTDExceptionType.Software or TTDExceptionType.Hardware)
+        program_counter (int): instruction where exception was thrown
+        code (int): exception code
+        flags (int): exception flags
+        record_address (int): where in memory the exception record is found
+        position (TTDPosition): position where exception occurred
+    """
+
+    def __init__(self, type: int, program_counter: int, code: int, flags: int, 
+                 record_address: int, position: TTDPosition):
+        self.type = type
+        self.program_counter = program_counter
+        self.code = code
+        self.flags = flags
+        self.record_address = record_address
+        self.position = position
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.type == other.type and
+                self.program_counter == other.program_counter and
+                self.code == other.code and
+                self.flags == other.flags and
+                self.record_address == other.record_address and
+                self.position == other.position)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.type, self.program_counter, self.code, self.flags,
+                     self.record_address, self.position))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        type_str = "Hardware" if self.type == TTDExceptionType.Hardware else "Software"
+        return f"<TTDException: {type_str} @ {self.program_counter:#x}, code {self.code:#x}>"
+
+
+class TTDEvent:
+    """
+    TTDEvent represents important events that happened during a TTD trace.
+    
+    Attributes:
+        type (int): type of event (TTDEventType enum value)
+        position (TTDPosition): position where event occurred
+        module (TTDModule or None): module information for ModuleLoaded/ModuleUnloaded events
+        thread (TTDThread or None): thread information for ThreadCreated/ThreadTerminated events
+        exception (TTDException or None): exception information for Exception events
+    """
+
+    def __init__(self, type: int, position: TTDPosition, module = None, thread = None, exception = None):
+        self.type = type
+        self.position = position
+        self.module = module
+        self.thread = thread
+        self.exception = exception
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return (self.type == other.type and
+                self.position == other.position and
+                self.module == other.module and
+                self.thread == other.thread and
+                self.exception == other.exception)
+
+    def __ne__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((self.type, self.position, self.module, self.thread, self.exception))
+
+    def __setattr__(self, name, value):
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            raise AttributeError(f"attribute '{name}' is read only")
+
+    def __repr__(self):
+        type_names = {
+            TTDEventType.ThreadCreated: "ThreadCreated",
+            TTDEventType.ThreadTerminated: "ThreadTerminated", 
+            TTDEventType.ModuleLoaded: "ModuleLoaded",
+            TTDEventType.ModuleUnloaded: "ModuleUnloaded",
+            TTDEventType.Exception: "Exception"
+        }
+        type_str = type_names.get(self.type, f"Unknown({self.type})")
+        return f"<TTDEvent: {type_str} @ {self.position}>"
 
 
 class DebuggerController:
@@ -1047,6 +1500,31 @@ class DebuggerController:
 
         return dbgcore.BNDebuggerRunTo(self.handle, addr_list, len(address))
 
+    def run_to_reverse(self, address) -> bool:
+        """
+        Resume the target in reverse, and wait for it to break at the given address(es).
+
+        The address parameter can be either an integer, or a list of integers.
+
+        Internally, the debugger places breakpoints on these addresses, resumes the target in reverse, and waits for the target
+        to break. Then the debugger removes the added breakpoints.
+
+        The call is asynchronous and returns before the target stops.
+
+        :return: whether the operation is successfully requested
+        """
+        if isinstance(address, int):
+            address = [address]
+
+        if not isinstance(address, list):
+            raise NotImplementedError
+
+        addr_list = (ctypes.c_uint64 * len(address))()
+        for i in range(len(address)):
+            addr_list[i] = address[i]
+
+        return dbgcore.BNDebuggerRunToReverse(self.handle, addr_list, len(address))
+
     def go_and_wait(self) -> DebugStopReason:
         """
         Resume the target.
@@ -1200,6 +1678,31 @@ class DebuggerController:
 
         return DebugStopReason(dbgcore.BNDebuggerRunToAndWait(self.handle, addr_list, len(address)))
 
+    def run_to_reverse_and_wait(self, address) -> DebugStopReason:
+        """
+        Resume the target in reverse, and wait for it to break at the given address(es).
+
+        The address parameter can be either an integer, or a list of integers.
+
+        Internally, the debugger places breakpoints on these addresses, resumes the target in reverse, and waits for the target
+        to break. Then the debugger removes the added breakpoints.
+
+        The call is blocking and only returns when the target stops.
+
+        :return: the reason for the stop
+        """
+        if isinstance(address, int):
+            address = [address]
+
+        if not isinstance(address, list):
+            raise NotImplementedError
+
+        addr_list = (ctypes.c_uint64 * len(address))()
+        for i in range(len(address)):
+            addr_list[i] = address[i]
+
+        return DebugStopReason(dbgcore.BNDebuggerRunToReverseAndWait(self.handle, addr_list, len(address)))
+
     def pause_and_wait(self) -> None:
         """
         Pause a running target.
@@ -1291,6 +1794,17 @@ class DebuggerController:
     @remote_port.setter
     def pid_attach(self, pid: int) -> None:
         dbgcore.BNDebuggerSetPIDAttach(self.handle, pid)
+
+    @property
+    def active_pid(self) -> int:
+        """
+        The PID of the process currently being debugged. (read-only)
+
+        This returns the PID of the currently attached or running process.
+
+        :return: the PID of the active process, or 0 if no process is active or the PID is unavailable
+        """
+        return dbgcore.BNDebuggerGetActivePID(self.handle)
 
     @property
     def executable_path(self) -> str:
@@ -1445,6 +1959,38 @@ class DebuggerController:
         else:
             raise NotImplementedError
 
+    def enable_breakpoint(self, address):
+        """
+        Enable a breakpoint
+
+        The input can be either an absolute address, or a ModuleNameAndOffset, which specifies a relative address to the
+        start of a module. The latter is useful for ASLR.
+
+        :param address: the address of breakpoint to enable
+        """
+        if isinstance(address, int):
+            dbgcore.BNDebuggerEnableAbsoluteBreakpoint(self.handle, address)
+        elif isinstance(address, ModuleNameAndOffset):
+            dbgcore.BNDebuggerEnableRelativeBreakpoint(self.handle, address.module, address.offset)
+        else:
+            raise NotImplementedError
+
+    def disable_breakpoint(self, address):
+        """
+        Disable a breakpoint
+
+        The input can be either an absolute address, or a ModuleNameAndOffset, which specifies a relative address to the
+        start of a module. The latter is useful for ASLR.
+
+        :param address: the address of breakpoint to disable
+        """
+        if isinstance(address, int):
+            dbgcore.BNDebuggerDisableAbsoluteBreakpoint(self.handle, address)
+        elif isinstance(address, ModuleNameAndOffset):
+            dbgcore.BNDebuggerDisableRelativeBreakpoint(self.handle, address.module, address.offset)
+        else:
+            raise NotImplementedError
+
     @property
     def ip(self) -> int:
         """
@@ -1585,6 +2131,344 @@ class DebuggerController:
     @property
     def is_ttd(self):
         return dbgcore.BNDebuggerIsTTD(self.handle)
+
+    @property
+    def current_ttd_position(self):
+        """
+        Get the current position in the TTD trace.
+        
+        Returns:
+            TTDPosition: Current position, or None if not in TTD mode
+        """
+        if not self.is_ttd:
+            return None
+        
+        pos = dbgcore.BNDebuggerGetCurrentTTDPosition(self.handle)
+        return TTDPosition(pos.sequence, pos.step)
+
+    @current_ttd_position.setter
+    def current_ttd_position(self, position):
+        """
+        Navigate to a specific position in the TTD trace.
+        
+        Args:
+            position: TTDPosition object or string in format "sequence:step"
+        """
+        if not self.is_ttd:
+            raise RuntimeError("TTD is not active")
+        
+        if isinstance(position, str):
+            position = TTDPosition.from_string(position)
+        elif not isinstance(position, TTDPosition):
+            raise TypeError("Position must be TTDPosition object or string")
+        
+        # Create the C structure
+        pos = dbgcore.BNDebuggerTTDPosition()
+        pos.sequence = position.sequence
+        pos.step = position.step
+        
+        success = dbgcore.BNDebuggerSetTTDPosition(self.handle, pos)
+        if not success:
+            raise RuntimeError("Failed to navigate to the specified TTD position")
+
+    def set_ttd_position(self, position):
+        """
+        Navigate to a specific position in the TTD trace.
+        
+        Args:
+            position: TTDPosition object or string in format "sequence:step"
+            
+        Returns:
+            bool: True if navigation succeeded, False otherwise
+        """
+        if not self.is_ttd:
+            return False
+        
+        if isinstance(position, str):
+            position = TTDPosition.from_string(position)
+        elif not isinstance(position, TTDPosition):
+            raise TypeError("Position must be TTDPosition object or string")
+        
+        # Create the C structure
+        pos = dbgcore.BNDebuggerTTDPosition()
+        pos.sequence = position.sequence
+        pos.step = position.step
+        
+        return dbgcore.BNDebuggerSetTTDPosition(self.handle, pos)
+
+    def navigate_to_timestamp(self, timestamp_str):
+        """
+        Convenience method to navigate to a timestamp string.
+        
+        Args:
+            timestamp_str: String in format "sequence:step" (hex or decimal)
+            
+        Returns:
+            bool: True if navigation succeeded, False otherwise
+        """
+        try:
+            position = TTDPosition.from_string(timestamp_str)
+            return self.set_ttd_position(position)
+        except ValueError as e:
+            binaryninja.log_error(f"Invalid timestamp format: {e}")
+            return False
+
+    def get_ttd_memory_access_for_address(self, address: int, size: int, access_type = DebuggerTTDMemoryAccessType.DebuggerTTDMemoryRead) -> List[TTDMemoryEvent]:
+        """
+        Get TTD memory access events for a specific address range.
+
+        This method is only available when debugging with TTD (Time Travel Debugging).
+        Use the is_ttd property to check if TTD is available before calling this method.
+
+        :param address: starting memory address to query
+        :param size: size of memory region to query
+        :param access_type: type of memory access to query - can be:
+                           - DebuggerTTDMemoryAccessType enum values
+                           - String specification like "r", "w", "e", "rw", "rwe", etc.
+                           - Integer values (for backward compatibility)
+        :return: list of TTDMemoryEvent objects
+        :raises: May raise an exception if TTD is not available
+        """
+        # Parse access type if it's a string
+        parsed_access_type = parse_ttd_access_type(access_type)
+        
+        count = ctypes.c_ulonglong()
+        events = dbgcore.BNDebuggerGetTTDMemoryAccessForAddress(self.handle, address, size, parsed_access_type, count)
+
+        if not events:
+            return []
+
+        result = []
+        for i in range(count.value):
+            event = events[i]
+            time_start = TTDPosition(event.timeStart.sequence, event.timeStart.step)
+            time_end = TTDPosition(event.timeEnd.sequence, event.timeEnd.step)
+
+            memory_event = TTDMemoryEvent(
+                event_type=event.eventType if event.eventType else "",
+                thread_id=event.threadId,
+                unique_thread_id=event.uniqueThreadId,
+                time_start=time_start,
+                time_end=time_end,
+                address=event.address,
+                size=event.size,
+                memory_address=event.memoryAddress,
+                instruction_address=event.instructionAddress,
+                value=event.value,
+                access_type=event.accessType
+            )
+            result.append(memory_event)
+
+        dbgcore.BNDebuggerFreeTTDMemoryEvents(events, count.value)
+        return result
+
+    def get_ttd_calls_for_symbols(self, symbols: str, start_return_address: int = 0, end_return_address: int = 0) -> List[TTDCallEvent]:
+        """
+        Get TTD call events for specific symbols/functions.
+
+        This method is only available when debugging with TTD (Time Travel Debugging).
+        Use the is_ttd property to check if TTD is available before calling this method.
+
+        :param symbols: symbol or function name to query (e.g., "MessageBoxA", "CreateFileA")
+        :param start_return_address: optional start return address filter (0 = no filter)
+        :param end_return_address: optional end return address filter (0 = no filter)
+        :return: list of TTDCallEvent objects
+        :raises: May raise an exception if TTD is not available
+        """
+        count = ctypes.c_ulonglong()
+        events = dbgcore.BNDebuggerGetTTDCallsForSymbols(self.handle, symbols, start_return_address, end_return_address, count)
+
+        if not events:
+            return []
+
+        result = []
+        for i in range(count.value):
+            event = events[i]
+            time_start = TTDPosition(event.timeStart.sequence, event.timeStart.step)
+            time_end = TTDPosition(event.timeEnd.sequence, event.timeEnd.step)
+
+            # Convert parameters array to Python list
+            parameters = []
+            if event.parameters and event.parameterCount > 0:
+                for j in range(event.parameterCount):
+                    parameters.append(event.parameters[j])
+
+            call_event = TTDCallEvent(
+                event_type=event.eventType if event.eventType else "",
+                thread_id=event.threadId,
+                unique_thread_id=event.uniqueThreadId,
+                function=event.function if event.function else "",
+                function_address=event.functionAddress,
+                return_address=event.returnAddress,
+                return_value=event.returnValue,
+                has_return_value=event.hasReturnValue,
+                parameters=parameters,
+                time_start=time_start,
+                time_end=time_end
+            )
+            result.append(call_event)
+
+        dbgcore.BNDebuggerFreeTTDCallEvents(events, count.value)
+        return result
+
+    def get_ttd_events(self, event_type: int) -> List[TTDEvent]:
+        """
+        Get TTD events for specific event types using bitfield filtering.
+
+        This method is only available when debugging with TTD (Time Travel Debugging).
+        Use the is_ttd property to check if TTD is available before calling this method.
+
+        :param event_type: type of events to query (TTDEventType bitfield flags that can be combined with ``|``)
+        :return: list of TTDEvent objects
+        :rtype: List[TTDEvent]
+        """
+        if self.handle is None:
+            return []
+
+        count = ctypes.c_size_t()
+        events = dbgcore.BNDebuggerGetTTDEvents(self.handle, event_type, ctypes.byref(count))
+
+        result = []
+        if not events or count.value == 0:
+            return result
+
+        for i in range(count.value):
+            event = events[i]
+            
+            position = TTDPosition(event.position.sequence, event.position.step)
+            
+            # Convert optional module details
+            module = None
+            if event.module:
+                module = TTDModule(
+                    name=event.module.contents.name if event.module.contents.name else "",
+                    address=event.module.contents.address,
+                    size=event.module.contents.size,
+                    checksum=event.module.contents.checksum,
+                    timestamp=event.module.contents.timestamp
+                )
+            
+            # Convert optional thread details
+            thread = None
+            if event.thread:
+                lifetime_start = TTDPosition(event.thread.contents.lifetimeStart.sequence, event.thread.contents.lifetimeStart.step)
+                lifetime_end = TTDPosition(event.thread.contents.lifetimeEnd.sequence, event.thread.contents.lifetimeEnd.step)
+                active_time_start = TTDPosition(event.thread.contents.activeTimeStart.sequence, event.thread.contents.activeTimeStart.step)
+                active_time_end = TTDPosition(event.thread.contents.activeTimeEnd.sequence, event.thread.contents.activeTimeEnd.step)
+                
+                thread = TTDThread(
+                    unique_id=event.thread.contents.uniqueId,
+                    id=event.thread.contents.id,
+                    lifetime_start=lifetime_start,
+                    lifetime_end=lifetime_end,
+                    active_time_start=active_time_start,
+                    active_time_end=active_time_end
+                )
+            
+            # Convert optional exception details
+            exception = None
+            if event.exception:
+                exception_position = TTDPosition(event.exception.contents.position.sequence, event.exception.contents.position.step)
+                
+                exception = TTDException(
+                    type=event.exception.contents.type,
+                    program_counter=event.exception.contents.programCounter,
+                    code=event.exception.contents.code,
+                    flags=event.exception.contents.flags,
+                    record_address=event.exception.contents.recordAddress,
+                    position=exception_position
+                )
+
+            ttd_event = TTDEvent(
+                type=event.type,
+                position=position,
+                module=module,
+                thread=thread,
+                exception=exception
+            )
+            result.append(ttd_event)
+
+        dbgcore.BNDebuggerFreeTTDEvents(events, count.value)
+        return result
+
+    def get_all_ttd_events(self) -> List[TTDEvent]:
+        """
+        Get all TTD events from the trace.
+
+        This method is only available when debugging with TTD (Time Travel Debugging).
+        Use the is_ttd property to check if TTD is available before calling this method.
+
+        :return: list of all TTDEvent objects in the trace
+        :rtype: List[TTDEvent]
+        """
+        if self.handle is None:
+            return []
+
+        count = ctypes.c_size_t()
+        events = dbgcore.BNDebuggerGetAllTTDEvents(self.handle, ctypes.byref(count))
+
+        result = []
+        if not events or count.value == 0:
+            return result
+
+        for i in range(count.value):
+            event = events[i]
+            
+            position = TTDPosition(event.position.sequence, event.position.step)
+            
+            # Convert optional module details
+            module = None
+            if event.module:
+                module = TTDModule(
+                    name=event.module.contents.name if event.module.contents.name else "",
+                    address=event.module.contents.address,
+                    size=event.module.contents.size,
+                    checksum=event.module.contents.checksum,
+                    timestamp=event.module.contents.timestamp
+                )
+            
+            # Convert optional thread details
+            thread = None
+            if event.thread:
+                lifetime_start = TTDPosition(event.thread.contents.lifetimeStart.sequence, event.thread.contents.lifetimeStart.step)
+                lifetime_end = TTDPosition(event.thread.contents.lifetimeEnd.sequence, event.thread.contents.lifetimeEnd.step)
+                active_time_start = TTDPosition(event.thread.contents.activeTimeStart.sequence, event.thread.contents.activeTimeStart.step)
+                active_time_end = TTDPosition(event.thread.contents.activeTimeEnd.sequence, event.thread.contents.activeTimeEnd.step)
+                
+                thread = TTDThread(
+                    unique_id=event.thread.contents.uniqueId,
+                    id=event.thread.contents.id,
+                    lifetime_start=lifetime_start,
+                    lifetime_end=lifetime_end,
+                    active_time_start=active_time_start,
+                    active_time_end=active_time_end
+                )
+            
+            # Convert optional exception details
+            exception = None
+            if event.exception:
+                exception_position = TTDPosition(event.exception.contents.position.sequence, event.exception.contents.position.step)
+                
+                exception = TTDException(
+                    type=event.exception.contents.type,
+                    program_counter=event.exception.contents.programCounter,
+                    code=event.exception.contents.code,
+                    flags=event.exception.contents.flags,
+                    record_address=event.exception.contents.recordAddress,
+                    position=exception_position
+                )
+
+            ttd_event = TTDEvent(
+                type=event.type,
+                position=position,
+                module=module,
+                thread=thread,
+                exception=exception
+            )
+            result.append(ttd_event)
+
+        dbgcore.BNDebuggerFreeTTDEvents(events, count.value)
+        return result
 
     def __del__(self):
         if dbgcore is not None:

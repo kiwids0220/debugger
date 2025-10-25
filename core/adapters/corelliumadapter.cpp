@@ -227,6 +227,7 @@ bool CorelliumAdapter::Connect(const std::string& server, std::uint32_t port)
     const auto reply = this->m_rspConnector->TransmitAndReceive(RspData("?"));
     auto map = RspConnector::PacketToUnorderedMap(reply);
 	this->m_lastActiveThreadId = map["thread"];
+	this->m_processPid = map["thread"];
     m_isTargetRunning = false;
 
 	Ref<Settings> settings = Settings::Instance();
@@ -444,7 +445,7 @@ static intx::uint512 parseLittleEndianHexToUint512(const std::string& hex) {
 	for (size_t i = 0; i < limit; ++i)
 	{
 		std::string byteStr = hex.substr(i * 2, 2);
-		buffer[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
+		buffer[i] = static_cast<uint8_t>(strtoul(byteStr.c_str(), nullptr, 16));
 	}
 
 	return intx::le::load<intx::uint512>(buffer);
@@ -1027,6 +1028,12 @@ void CorelliumAdapter::HandleAsyncPacket(const RspData& data)
 std::vector<DebugProcess> CorelliumAdapter::GetProcessList()
 {
 	return {};
+}
+
+
+std::uint32_t CorelliumAdapter::GetActivePID()
+{
+	return m_processPid;
 }
 
 

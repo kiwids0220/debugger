@@ -22,6 +22,7 @@ limitations under the License.
 #include <list>
 #include <future>
 #include <functional>
+#include <unordered_set>
 #include "ffi_global.h"
 #include "refcountobject.h"
 #include "debuggerfileaccessor.h"
@@ -155,6 +156,7 @@ namespace BinaryNinjaDebugger {
 		DebugStopReason StepReturnAndWaitInternal();
 		DebugStopReason StepReturnReverseAndWaitInternal();
 		DebugStopReason RunToAndWaitInternal(const std::vector<uint64_t> &remoteAddresses);
+		DebugStopReason RunToReverseAndWaitInternal(const std::vector<uint64_t> &remoteAddresses);
 
 		// Whether we can start debugging, e.g., launch/attach/connec to a target
 		bool CanStartDebgging();
@@ -200,6 +202,10 @@ namespace BinaryNinjaDebugger {
 		uint64_t m_oldViewBase, m_newViewBase;
 		std::vector<BNAddressRange> m_ranges;
 
+		// TTD Code Coverage Analysis
+		std::unordered_set<uint64_t> m_executedInstructions;
+		bool m_codeCoverageAnalysisRun = false;
+
 	public:
 		DebuggerController(BinaryViewRef data);
 		static DbgRef<DebuggerController> GetController(BinaryViewRef data);
@@ -221,6 +227,10 @@ namespace BinaryNinjaDebugger {
 		void AddBreakpoint(const ModuleNameAndOffset& address);
 		void DeleteBreakpoint(uint64_t address);
 		void DeleteBreakpoint(const ModuleNameAndOffset& address);
+		void EnableBreakpoint(uint64_t address);
+		void EnableBreakpoint(const ModuleNameAndOffset& address);
+		void DisableBreakpoint(uint64_t address);
+		void DisableBreakpoint(const ModuleNameAndOffset& address);
 		DebugBreakpoint GetAllBreakpoints();
 
 		// registers
@@ -300,6 +310,7 @@ namespace BinaryNinjaDebugger {
 		bool StepReturn();
 		bool StepReturnReverse();
 		bool RunTo(const std::vector<uint64_t>& remoteAddresses);
+		bool RunToReverse(const std::vector<uint64_t>& remoteAddresses);
 		bool Pause();
 
 		DebugStopReason ExecuteAdapterAndWait(const DebugAdapterOperation operation);
@@ -318,6 +329,7 @@ namespace BinaryNinjaDebugger {
 		DebugStopReason StepReturnAndWait();
 		DebugStopReason StepReturnReverseAndWait();
 		DebugStopReason RunToAndWait(const std::vector<uint64_t>& remoteAddresses);
+		DebugStopReason RunToReverseAndWait(const std::vector<uint64_t>& remoteAddresses);
 		DebugStopReason PauseAndWait();
 		void DetachAndWait();
 		void QuitAndWait();
@@ -331,6 +343,7 @@ namespace BinaryNinjaDebugger {
 		DebuggerFileAccessor* GetMemoryAccessor() const { return m_accessor; }
 
 		uint32_t GetExitCode();
+		uint32_t GetActivePID();
 
 		void WriteStdIn(const std::string message);
 
@@ -356,8 +369,17 @@ namespace BinaryNinjaDebugger {
 		// TTD Memory Analysis Methods
 		std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType = TTDMemoryRead);
 		std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0);
+		std::vector<TTDEvent> GetTTDEvents(TTDEventType eventType);
+		std::vector<TTDEvent> GetAllTTDEvents();
 		TTDPosition GetCurrentTTDPosition();
 		bool SetTTDPosition(const TTDPosition& position);
+
+		// TTD Code Coverage Analysis Methods
+		bool IsInstructionExecuted(uint64_t address);
+		bool RunCodeCoverageAnalysis(uint64_t startAddress, uint64_t endAddress);
+		size_t GetExecutedInstructionCount() const;
+		bool SaveCodeCoverageToFile(const std::string& filePath) const;
+		bool LoadCodeCoverageFromFile(const std::string& filePath);
 
 		void OnRebased(BinaryView* oldView, BinaryView* newView);
 

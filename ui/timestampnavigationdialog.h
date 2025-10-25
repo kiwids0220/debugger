@@ -17,37 +17,33 @@ limitations under the License.
 #pragma once
 
 #include <QDialog>
-#include <QPushButton>
 #include <QLineEdit>
-#include <QComboBox>
+#include <QLabel>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QFormLayout>
-#include <QCheckBox>
-#include "inttypes.h"
-#include "binaryninjaapi.h"
-#include "viewframe.h"
-#include "fontsettings.h"
+#include <QDialogButtonBox>
 #include "debuggerapi.h"
 
 using namespace BinaryNinjaDebuggerAPI;
 
-class TTDRecordDialog : public QDialog
+class TimestampNavigationDialog : public QDialog
 {
 	Q_OBJECT
 
 private:
-	DbgRef<DebuggerController> m_controller = nullptr;
-	QLineEdit* m_pathEntry;
-	QLineEdit* m_workingDirectoryEntry;
-	QLineEdit* m_argumentsEntry;
-	QLineEdit* m_outputDirectory;
-	QCheckBox* m_launchWithoutTracing;
-	QCheckBox* m_traceChildProcesses;
+	DbgRef<DebuggerController> m_controller;
+	QLineEdit* m_timestampEdit;
+	QLabel* m_helpLabel;
+	QDialogButtonBox* m_buttonBox;
+
+	void initializePositions();
 
 public:
-	TTDRecordDialog(QWidget* parent, BinaryView* data);
-	void DoTTDTrace();
-	std::string GetTTDRecorderPath();
+	TimestampNavigationDialog(QWidget* parent, DbgRef<DebuggerController> controller);
 
 private Q_SLOTS:
-	void apply();
+	void navigate();
+	void validateInput();
 };

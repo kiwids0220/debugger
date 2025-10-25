@@ -38,13 +38,15 @@ limitations under the License.
 #include <QPropertyAnimation>
 #include <QParallelAnimationGroup>
 #include <QFrame>
-#include <QShortcut>
+#include <QContextMenuEvent>
 #include "inttypes.h"
 #include "binaryninjaapi.h"
 #include "debuggerapi.h"
 #include "viewframe.h"
 #include "expandablegroup.h"
 #include "debuggeruicommon.h"
+#include "menus.h"
+#include "uitypes.h"
 
 using namespace BinaryNinja;
 using namespace BinaryNinjaDebuggerAPI;
@@ -56,7 +58,8 @@ class TTDCallsQueryWidget : public QWidget
 
 public:
 	// Enum for logical column identification
-	enum LogicalColumn {
+	enum LogicalColumn
+	{
 		IndexColumn = 0,
 		EventTypeColumn,
 		TimeStartColumn,
@@ -73,36 +76,58 @@ public:
 private:
 	BinaryViewRef m_data;
 	DbgRef<DebuggerController> m_controller;
-	
+
 	// Input controls
 	QLineEdit* m_symbolsEdit;
 	QLineEdit* m_startAddressEdit;
 	QLineEdit* m_endAddressEdit;
 	QPushButton* m_queryButton;
 	QPushButton* m_clearButton;
-	
+
 	// Results table
 	QTableWidget* m_resultsTable;
-	
+
+	// Status label
+	QLabel* m_statusLabel;
+
 	// Column visibility
 	QStringList m_columnNames;
 	QList<bool> m_columnVisibility;
-	
+
+	// UIAction support
+	UIActionHandler m_actionHandler;
+	ContextMenuManager* m_contextMenuManager;
+	Menu* m_menu;
+
 	void setupUI();
 	void setupTable();
+	void updateStatus(const QString& message);
 	uint64_t parseAddress(const QString& text);
 	void setupContextMenu();
+	void setupUIActions();
 	void updateColumnVisibility();
-	
+	bool canCopy();
+
+	virtual void contextMenuEvent(QContextMenuEvent* event) override;
+
 public:
 	TTDCallsQueryWidget(QWidget* parent, BinaryViewRef data);
 	virtual ~TTDCallsQueryWidget();
-	
+
 	// Method to set parameters and execute query from context menu
 	void setParametersAndQuery(const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
-	
+
+	// Method to set parameters without executing query (for duplicating tabs)
+	void setParameters(const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
+	void setParameters(const QString& symbols, const QString& startAddr, const QString& endAddr);
+
 	// Method to check if this tab is unused (no results and default parameters)
 	bool isUnused() const;
+
+	// Methods to get current query parameters for duplication
+	QString getSymbols() const { return m_symbolsEdit->text(); }
+	QString getStartAddress() const { return m_startAddressEdit->text(); }
+	QString getEndAddress() const { return m_endAddressEdit->text(); }
 
 private Q_SLOTS:
 	void performQuery();
@@ -111,6 +136,7 @@ private Q_SLOTS:
 	void showColumnVisibilityDialog();
 	void resetColumnsToDefault();
 	void showContextMenu(const QPoint& position);
+	void copy();
 	void copySelectedCell();
 	void copySelectedRow();
 	void copyEntireTable();
@@ -125,13 +151,13 @@ private:
 	DbgRef<DebuggerController> m_controller;
 	QTabWidget* m_tabWidget;
 	QToolButton* m_newTabButton;
-	
+
 	void setupUI();
 
 public:
 	TTDCallsWidget(QWidget* parent, BinaryViewRef data);
 	virtual ~TTDCallsWidget();
-	
+
 	// Method to get current query widget or create new tab
 	TTDCallsQueryWidget* getCurrentOrNewQueryWidget();
 	void setParametersAndQuery(const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
@@ -155,7 +181,7 @@ private:
 public:
 	TTDCallsSidebarWidget(BinaryViewRef data);
 	~TTDCallsSidebarWidget();
-	
+
 	// Method to access the TTD Calls widget for context menu actions
 	void setParametersAndQuery(const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
 	void setParametersAndQueryInNewTab(const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
@@ -165,7 +191,8 @@ public:
 class TTDCallsWidgetType : public SidebarWidgetType
 {
 private:
-	struct PendingQuery {
+	struct PendingQuery
+	{
 		std::string symbols;
 		uint64_t startAddr;
 		uint64_t endAddr;
@@ -175,11 +202,12 @@ private:
 public:
 	TTDCallsWidgetType();
 	SidebarWidget* createWidget(ViewFrame* frame, BinaryViewRef data) override;
-	SidebarWidgetLocation defaultLocation() const override { return SidebarWidgetLocation::RightBottom; }
+	SidebarWidgetLocation defaultLocation() const override { return SidebarWidgetLocation::RightContent; }
 	SidebarContextSensitivity contextSensitivity() const override { return PerViewTypeSidebarContext; }
 	SidebarIconVisibility defaultIconVisibility() const override { return HideSidebarIconIfNoContent; }
 	SidebarContentClassifier* contentClassifier(ViewFrame*, BinaryViewRef) override;
-	
+
 	// Static method to set pending query parameters
-	static void SetPendingQuery(ViewFrame* frame, BinaryViewRef data, const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
+	static void SetPendingQuery(
+		ViewFrame* frame, BinaryViewRef data, const std::string& symbols, uint64_t startAddr = 0, uint64_t endAddr = 0);
 };

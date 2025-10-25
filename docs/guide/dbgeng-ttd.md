@@ -14,16 +14,14 @@ There are two ways to install and configure WinDbg to be used by Binary Ninja de
 We recommend you to try the first method first. 
 If it does not work, for example if your machine cannot connect to the Internet, you can follow the second method to set it up manually.
 
-The free version currently does not support installing WinDbg automatically. It needs to be installed manually.
-
 The WinDbg installation only needs to be done once.
 
 ### Install WinDbg Automatically
 
 - Open Binary Ninja
 - Click Menu -> "Debugger" -> "Install WinDbg/TTD"
-- Wait for the script to finish
-    - Behind the scenes, this runs the Python [script](https://github.com/Vector35/debugger/blob/dev/core/adapters/dbgeng/install_windbg.py) to download and configure WinDbg
+- Wait for the installation to finish
+    - Behind the scenes, this runs a C++ installer that downloads and configures WinDbg
     - The WinDbg will be installed to `%APPDATA%\Binary Ninja\windbg`
 - Restart Binary Ninja
 
@@ -65,6 +63,8 @@ all types of recording supported by WinDbg (e.g., attach to a running process an
     - Working Directory: the working directory to launch the executable in
     - Command Line Arguments: the command line arguments to pass to the executable
     - Trace Output Directory: the directory to write the trace. By default, it is equal to the working directory, but can be changed if necessary
+    - Start application With Recording Off: if checked, starts the application with tracing disabled initially (useful for manual tracing control)
+    - Trace Child Processes: if checked, includes child processes spawned by the main process in the trace recording
 - Click "Record". A UAC dialog will pop up to because the TTD recording requires Administrator privilege
 - Accept the elevation. The program will be launched and recorded. Once it exits, find the trace file in the trace output directory
 

@@ -21,6 +21,7 @@ limitations under the License.
 #include <QModelIndex>
 #include <QTableView>
 #include <QStyledItemDelegate>
+#include <QKeyEvent>
 #include "inttypes.h"
 #include "binaryninjaapi.h"
 #include "viewframe.h"
@@ -64,7 +65,7 @@ protected:
 public:
 	enum ColumnHeaders
 	{
-		//EnabledColumn,
+		EnabledColumn,
 		LocationColumn,
 		AddressColumn,
 	};
@@ -82,7 +83,7 @@ public:
 	virtual int columnCount(const QModelIndex& parent = QModelIndex()) const override
 	{
 		(void)parent;
-		return 2;
+		return 3;
 	}
 	BreakpointItem getRow(int row) const;
 	virtual QVariant data(const QModelIndex& i, int role) const override;
@@ -127,11 +128,14 @@ class DebugBreakpointsWidget : public QTableView
 	Menu* m_menu;
 
 	bool selectionNotEmpty();
+	void copySelection();
 
 	//void shouldBeVisible()
 	//virtual void notifyFontChanged() override;
 
 	virtual void contextMenuEvent(QContextMenuEvent* event) override;
+	virtual void keyPressEvent(QKeyEvent* event) override;
+	virtual void mousePressEvent(QMouseEvent* event) override;
 
 public:
 	DebugBreakpointsWidget(ViewFrame* view, BinaryViewRef data, Menu* menu);
@@ -145,6 +149,10 @@ private slots:
 	void remove();
 	void onDoubleClicked();
 	void add();
+	void toggleSelected();
+	void enableAll();
+	void disableAll();
+	void soloSelected();
 
 public slots:
 	void updateContent();

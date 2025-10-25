@@ -16,6 +16,7 @@ limitations under the License.
 
 #include "debuggercontroller.h"
 #include <thread>
+#include <fstream>
 #include "lowlevelilinstruction.h"
 #include "mediumlevelilinstruction.h"
 #include "highlevelilinstruction.h"
@@ -94,6 +95,46 @@ void DebuggerController::DeleteBreakpoint(const ModuleNameAndOffset& address)
 	m_state->DeleteBreakpoint(address);
 	DebuggerEvent event;
 	event.type = RelativeBreakpointRemovedEvent;
+	event.data.relativeAddress = address;
+	PostDebuggerEvent(event);
+}
+
+
+void DebuggerController::EnableBreakpoint(uint64_t address)
+{
+	m_state->EnableBreakpoint(address);
+	DebuggerEvent event;
+	event.type = AbsoluteBreakpointEnabledEvent;
+	event.data.absoluteAddress = address;
+	PostDebuggerEvent(event);
+}
+
+
+void DebuggerController::EnableBreakpoint(const ModuleNameAndOffset& address)
+{
+	m_state->EnableBreakpoint(address);
+	DebuggerEvent event;
+	event.type = RelativeBreakpointEnabledEvent;
+	event.data.relativeAddress = address;
+	PostDebuggerEvent(event);
+}
+
+
+void DebuggerController::DisableBreakpoint(uint64_t address)
+{
+	m_state->DisableBreakpoint(address);
+	DebuggerEvent event;
+	event.type = AbsoluteBreakpointDisabledEvent;
+	event.data.absoluteAddress = address;
+	PostDebuggerEvent(event);
+}
+
+
+void DebuggerController::DisableBreakpoint(const ModuleNameAndOffset& address)
+{
+	m_state->DisableBreakpoint(address);
+	DebuggerEvent event;
+	event.type = RelativeBreakpointDisabledEvent;
 	event.data.relativeAddress = address;
 	PostDebuggerEvent(event);
 }
@@ -1107,6 +1148,33 @@ DebugStopReason DebuggerController::RunToAndWaitInternal(const std::vector<uint6
 }
 
 
+DebugStopReason DebuggerController::RunToReverseAndWaitInternal(const std::vector<uint64_t>& remoteAddresses)
+{
+	m_userRequestedBreak = false;
+
+	for (uint64_t remoteAddress : remoteAddresses)
+	{
+		if (!m_state->GetBreakpoints()->ContainsAbsolute(remoteAddress))
+		{
+			m_adapter->AddBreakpoint(remoteAddress);
+		}
+	}
+
+	auto reason = GoReverseAndWaitInternal();
+
+	for (uint64_t remoteAddress : remoteAddresses)
+	{
+		if (!m_state->GetBreakpoints()->ContainsAbsolute(remoteAddress))
+		{
+			m_adapter->RemoveBreakpoint(remoteAddress);
+		}
+	}
+
+	NotifyStopped(reason);
+	return reason;
+}
+
+
 bool DebuggerController::RunTo(const std::vector<uint64_t>& remoteAddresses)
 {
 	// This is an API function of the debugger. We only do these checks at the API level.
@@ -1114,6 +1182,18 @@ bool DebuggerController::RunTo(const std::vector<uint64_t>& remoteAddresses)
 		return false;
 
 	std::thread([&, remoteAddresses]() { RunToAndWait(remoteAddresses); }).detach();
+
+	return true;
+}
+
+
+bool DebuggerController::RunToReverse(const std::vector<uint64_t>& remoteAddresses)
+{
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanResumeTarget())
+		return false;
+
+	std::thread([&, remoteAddresses]() { RunToReverseAndWait(remoteAddresses); }).detach();
 
 	return true;
 }
@@ -1129,6 +1209,24 @@ DebugStopReason DebuggerController::RunToAndWait(const std::vector<uint64_t>& re
 		return InternalError;
 
 	auto reason = RunToAndWaitInternal(remoteAddresses);
+	if (!m_userRequestedBreak && (reason != ProcessExited) && (reason != InternalError))
+		NotifyStopped(reason);
+
+	m_targetControlMutex.unlock();
+	return reason;
+}
+
+
+DebugStopReason DebuggerController::RunToReverseAndWait(const std::vector<uint64_t>& remoteAddresses)
+{
+	// This is an API function of the debugger. We only do these checks at the API level.
+	if (!CanResumeTarget())
+		return InvalidStatusOrOperation;
+
+	if (!m_targetControlMutex.try_lock())
+		return InternalError;
+
+	auto reason = RunToReverseAndWaitInternal(remoteAddresses);
 	if (!m_userRequestedBreak && (reason != ProcessExited) && (reason != InternalError))
 		NotifyStopped(reason);
 
@@ -2049,6 +2147,14 @@ uint32_t DebuggerController::GetExitCode()
 }
 
 
+uint32_t DebuggerController::GetActivePID()
+{
+	if (!m_adapter)
+		return 0;
+	return m_adapter->GetActivePID();
+}
+
+
 void DebuggerController::WriteStdIn(const std::string message)
 {
 	if (m_adapter && m_state->IsRunning())
@@ -2815,13 +2921,13 @@ bool DebuggerController::IsTTD()
 std::vector<TTDMemoryEvent> DebuggerController::GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType)
 {
 	std::vector<TTDMemoryEvent> events;
-	
-	if (!IsTTD())
+
+	if (!m_state->IsConnected() || !IsTTD())
 	{
 		LogError("Current adapter does not support TTD");
 		return events;
 	}
-	
+
 	if (m_adapter)
 	{
 		events = m_adapter->GetTTDMemoryAccessForAddress(startAddress, endAddress, accessType);
@@ -2834,9 +2940,9 @@ std::vector<TTDCallEvent> DebuggerController::GetTTDCallsForSymbols(const std::s
 {
 	std::vector<TTDCallEvent> events;
 
-	if (!IsTTD())
+	if (!m_state->IsConnected() || !IsTTD())
 	{
-		LogError("Current adapter does not support TTD");
+		LogWarn("Current adapter does not support TTD");
 		return events;
 	}
 
@@ -2844,38 +2950,231 @@ std::vector<TTDCallEvent> DebuggerController::GetTTDCallsForSymbols(const std::s
 }
 
 
+std::vector<TTDEvent> DebuggerController::GetTTDEvents(TTDEventType eventType)
+{
+	std::vector<TTDEvent> events;
+
+	if (!m_state->IsConnected() || !IsTTD())
+	{
+		LogWarn("Current adapter does not support TTD");
+		return events;
+	}
+
+	return m_adapter->GetTTDEvents(eventType);
+}
+
+
+std::vector<TTDEvent> DebuggerController::GetAllTTDEvents()
+{
+	std::vector<TTDEvent> events;
+
+	if (!m_state->IsConnected() || !IsTTD())
+	{
+		LogWarn("Current adapter does not support TTD");
+		return events;
+	}
+
+	return m_adapter->GetAllTTDEvents();
+}
+
+
 TTDPosition DebuggerController::GetCurrentTTDPosition()
 {
 	TTDPosition position;
-	
-	if (!IsTTD())
+
+	if (!m_state->IsConnected() || !IsTTD())
 	{
-		LogError("Current adapter does not support TTD");
+		LogWarn("Current adapter does not support TTD");
 		return position;
 	}
-	
+
 	if (m_adapter)
 	{
 		position = m_adapter->GetCurrentTTDPosition();
 	}
-	
+
 	return position;
 }
 
 bool DebuggerController::SetTTDPosition(const TTDPosition& position)
 {
-	if (!IsTTD())
+	if (!m_state->IsConnected() || !IsTTD())
 	{
-		LogError("Current adapter does not support TTD");
+		LogWarn("Current adapter does not support TTD");
 		return false;
 	}
-	
+
 	if (m_adapter)
 	{
 		return m_adapter->SetTTDPosition(position);
 	}
 
 	return false;
+}
+
+
+bool DebuggerController::IsInstructionExecuted(uint64_t address)
+{
+	if (!m_state->IsConnected() || !IsTTD())
+	{
+		return false;
+	}
+
+	if (!m_codeCoverageAnalysisRun)
+	{
+		return false;
+	}
+
+	return m_executedInstructions.find(address) != m_executedInstructions.end();
+}
+
+
+bool DebuggerController::RunCodeCoverageAnalysis(uint64_t startAddress, uint64_t endAddress)
+{
+	if (!m_state->IsConnected() || !IsTTD())
+	{
+		LogWarn("Current adapter does not support TTD");
+		return false;
+	}
+
+	if (startAddress >= endAddress)
+	{
+		LogError("Invalid address range: start address must be less than end address");
+		return false;
+	}
+
+	// Clear previous analysis results
+	m_executedInstructions.clear();
+	m_codeCoverageAnalysisRun = false;
+	
+	LogInfo("Starting TTD code coverage analysis for range 0x%" PRIX64 " - 0x%" PRIX64 "...", startAddress, endAddress);
+	
+	// Query TTD for execute access covering the specified range
+	auto events = GetTTDMemoryAccessForAddress(startAddress, endAddress, TTDMemoryExecute);
+	
+	for (const auto& event : events)
+	{
+		if (event.accessType == TTDMemoryExecute)
+		{
+			// Add all executed instruction addresses within the range
+			if (event.instructionAddress >= startAddress && event.instructionAddress <= endAddress)
+			{
+				m_executedInstructions.insert(event.instructionAddress);
+			}
+		}
+	}
+
+	m_codeCoverageAnalysisRun = true;
+	LogInfo("TTD code coverage analysis completed for range. Found 0x%" PRIu64 "executed instructions.",
+			(uint64_t)m_executedInstructions.size());
+
+	return true;
+}
+
+
+size_t DebuggerController::GetExecutedInstructionCount() const
+{
+	return m_executedInstructions.size();
+}
+
+
+bool DebuggerController::SaveCodeCoverageToFile(const std::string& filePath) const
+{
+	if (!m_codeCoverageAnalysisRun)
+	{
+		LogError("No code coverage analysis has been run");
+		return false;
+	}
+
+	try
+	{
+		std::ofstream file(filePath, std::ios::binary);
+		if (!file.is_open())
+		{
+			LogError("%s", fmt::format("Failed to open file for writing: {}", filePath.c_str()).c_str());
+			return false;
+		}
+
+		// Write header
+		uint32_t magic = 0x54544443; // "TTDC" - TTD Coverage
+		uint32_t version = 1;
+		size_t count = m_executedInstructions.size();
+
+		file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+		file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+		file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+		// Write addresses
+		for (uint64_t addr : m_executedInstructions)
+		{
+			file.write(reinterpret_cast<const char*>(&addr), sizeof(addr));
+		}
+
+		file.close();
+		LogError("%s", fmt::format("Saved {} executed instruction addresses to {}", count, filePath.c_str()).c_str());
+
+		return true;
+	}
+	catch (const std::exception& e)
+	{
+		LogError("%s", fmt::format("Error saving code coverage: {}", e.what()).c_str());
+		return false;
+	}
+}
+
+
+bool DebuggerController::LoadCodeCoverageFromFile(const std::string& filePath)
+{
+	try
+	{
+		std::ifstream file(filePath, std::ios::binary);
+		if (!file.is_open())
+		{
+			LogError("%s", fmt::format("Failed to open file for reading: {}", filePath.c_str()).c_str());
+			return false;
+		}
+
+		// Read header
+		uint32_t magic, version;
+		size_t count;
+
+		file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+		if (magic != 0x54544443)
+		{
+			LogError("Invalid file format (magic number mismatch)");
+			return false;
+		}
+
+		file.read(reinterpret_cast<char*>(&version), sizeof(version));
+		if (version != 1)
+		{
+			LogError("%s", fmt::format("Unsupported file version: {}", version).c_str());
+			return false;
+		}
+
+		file.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+		// Clear existing data and read addresses
+		m_executedInstructions.clear();
+
+		for (size_t i = 0; i < count; i++)
+		{
+			uint64_t addr;
+			file.read(reinterpret_cast<char*>(&addr), sizeof(addr));
+			m_executedInstructions.insert(addr);
+		}
+
+		file.close();
+		m_codeCoverageAnalysisRun = true;
+
+		LogInfo("%s", fmt::format("Loaded {} executed instruction addresses from {}", count, filePath.c_str()).c_str());
+		return true;
+	}
+	catch (const std::exception& e)
+	{
+		LogError("%s", fmt::format("Error loading code coverage: {}", e.what()).c_str());
+		return false;
+	}
 }
 
 

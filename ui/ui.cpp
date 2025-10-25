@@ -25,6 +25,8 @@ limitations under the License.
 #include "QPainter"
 #include <QStatusBar>
 #include <QCoreApplication>
+#include <QProgressDialog>
+#include <QTimer>
 #include "fmt/format.h"
 #include "threadframes.h"
 #include "syncgroup.h"
@@ -42,12 +44,16 @@ limitations under the License.
 #include "debuggerinfowidget.h"
 #include "ttdmemorywidget.h"
 #include "ttdcallswidget.h"
+#include "ttdeventswidget.h"
+#include "ttdanalysisdialog.h"
+#include "timestampnavigationdialog.h"
 #include "freeversion.h"
 #include <QTimer>
 
 #ifdef WIN32
 	#include "ttdrecord.h"
 	#include "scriptingconsole.h"
+	#include "install_windbg.h"
 #endif
 
 
@@ -269,10 +275,10 @@ void GlobalDebuggerUI::QueryTTDCalls(const UIActionContext& ctxt, const std::str
 
 	// Set pending query first
 	TTDCallsWidgetType::SetPendingQuery(frame, ctxt.binaryView, symbols, startReturnAddr, endReturnAddr);
-	
+
 	// Activate the sidebar widget
 	sidebar->activate("TTD Calls");
-	
+
 	// Try to find the widget that was just created/activated and apply the query immediately
 	// We'll give it a moment to be created if needed
 	QTimer::singleShot(100, [sidebar, ctxt, symbols, startReturnAddr, endReturnAddr]() {
@@ -472,12 +478,25 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				{
 					isLocalLaunch = false;
 				}
+				
+				bool connectedToDebugServer = controller->IsConnectedToDebugServer();
 
 				if (isLocalLaunch && firstLaunch && Settings::Instance()->Get<bool>("debugger.confirmFirstLaunch"))
 				{
 					auto prompt = QString("You are about to launch \n\n%1\n\non your machine. "
 						"This may harm your machine. Are you sure to continue?").
 					  	arg(QString::fromStdString(controller->GetExecutablePath()));
+					if (QMessageBox::question(context->mainWindow(), "Launch Target", prompt) != QMessageBox::Yes)
+						return;
+				}
+				else if (!isLocalLaunch && connectedToDebugServer && firstLaunch &&
+					Settings::Instance()->Get<bool>("debugger.confirmFirstLaunch"))
+				{
+					auto remoteHost = QString::fromStdString(controller->GetRemoteHost());
+					auto remotePort = controller->GetRemotePort();
+					auto prompt = QString("You are about to launch \n\n%1\n\non remote host %2:%3. "
+						"Are you sure to continue?").arg(QString::fromStdString(controller->GetExecutablePath()))
+						.arg(remoteHost).arg(remotePort);
 					if (QMessageBox::question(context->mainWindow(), "Launch Target", prompt) != QMessageBox::Yes)
 						return;
 				}
@@ -669,6 +688,21 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 			connectedAndStopped));
 	debuggerMenu->addAction("Run To Here", "Control");
 
+	UIAction::registerAction("Run Back To Here", QKeySequence(Qt::ShiftModifier | Qt::Key_F4));
+	context->globalActions()->bindAction("Run Back To Here",
+		UIAction(
+			[this](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller)
+					return;
+
+				controller->RunToReverse(ctxt.address);
+				m_context->refreshCurrentViewContents();
+			},
+			connectedAndStoppedWithTTD));
+
 	UIAction::registerAction("Detach");
 	context->globalActions()->bindAction("Detach",
 		UIAction(
@@ -776,6 +810,120 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 			},
 			requireBinaryView));
 	debuggerMenu->addAction("Toggle Breakpoint", "Breakpoint");
+
+	// Helper function to check if there's a breakpoint at the current address and return its enabled state
+	auto getBreakpointEnabledState = [](BinaryView* view, uint64_t addr) -> std::pair<bool, bool> {
+		auto controller = DebuggerController::GetController(view);
+		if (!controller)
+			return {false, false}; // {hasBreakpoint, isEnabled}
+		
+		std::vector<DebugBreakpoint> breakpoints = controller->GetBreakpoints();
+		for (const auto& bp : breakpoints)
+		{
+			if (bp.address == addr)
+				return {true, bp.enabled};
+		}
+		return {false, false};
+	};
+
+	// Register dynamic "Enable/Disable Breakpoint" action
+	UIAction::registerAction("Enable Breakpoint");
+	
+	context->globalActions()->bindAction("Enable Breakpoint",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller)
+					return;
+
+				auto [hasBreakpoint, isEnabled] = getBreakpointEnabledState(ctxt.binaryView, ctxt.address);
+				bool isAbsoluteAddress = controller->IsConnected();
+				
+				if (isAbsoluteAddress)
+				{
+					if (isEnabled)
+						controller->DisableBreakpoint(ctxt.address);
+					else
+						controller->EnableBreakpoint(ctxt.address);
+				}
+				else
+				{
+					std::string filename = controller->GetInputFile();
+					uint64_t offset = ctxt.address - controller->GetViewFileSegmentsStart();
+					ModuleNameAndOffset info = {filename, offset};
+					if (isEnabled)
+						controller->DisableBreakpoint(info);
+					else
+						controller->EnableBreakpoint(info);
+				}
+			},
+			[=](const UIActionContext& ctxt) {
+				auto [hasBreakpoint, isEnabled] = getBreakpointEnabledState(ctxt.binaryView, ctxt.address);
+				return ctxt.binaryView && hasBreakpoint;
+			}));
+	
+	// Dynamically change the action name based on the current breakpoint state
+	UIAction::setActionDisplayName("Enable Breakpoint", [=](const UIActionContext& ctxt) -> QString {
+		if (!ctxt.binaryView)
+			return "Enable Breakpoint";
+		
+		auto [hasBreakpoint, isEnabled] = getBreakpointEnabledState(ctxt.binaryView, ctxt.address);
+		if (hasBreakpoint && isEnabled)
+			return "Disable Breakpoint";
+		
+		return "Enable Breakpoint";
+	});
+	
+	debuggerMenu->addAction("Enable Breakpoint", "Breakpoint");
+
+	// Register "Solo Breakpoint" action
+	UIAction::registerAction("Solo Breakpoint");
+	context->globalActions()->bindAction("Solo Breakpoint",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller)
+					return;
+
+				// Get the current address breakpoint location
+				bool isAbsoluteAddress = controller->IsConnected();
+				ModuleNameAndOffset currentInfo;
+				if (!isAbsoluteAddress)
+				{
+					std::string filename = controller->GetInputFile();
+					uint64_t offset = ctxt.address - controller->GetViewFileSegmentsStart();
+					currentInfo = {filename, offset};
+				}
+
+				// Disable all breakpoints
+				std::vector<DebugBreakpoint> breakpoints = controller->GetBreakpoints();
+				for (const auto& bp : breakpoints)
+				{
+					ModuleNameAndOffset info;
+					info.module = bp.module;
+					info.offset = bp.offset;
+					controller->DisableBreakpoint(info);
+				}
+
+				// Enable the current breakpoint
+				if (isAbsoluteAddress)
+				{
+					controller->EnableBreakpoint(ctxt.address);
+				}
+				else
+				{
+					controller->EnableBreakpoint(currentInfo);
+				}
+			},
+			[=](const UIActionContext& ctxt) {
+				auto [hasBreakpoint, isEnabled] = getBreakpointEnabledState(ctxt.binaryView, ctxt.address);
+				return ctxt.binaryView && hasBreakpoint;
+			}));
+	debuggerMenu->addAction("Solo Breakpoint", "Breakpoint");
 
 	UIAction::registerAction("Connect to Debug Server");
 	context->globalActions()->bindAction("Connect to Debug Server",
@@ -987,6 +1135,13 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 			connectedAndStopped));
 	debuggerMenu->addAction("Force Update Memory Cache", "Misc");
 
+	// Register actions for TTD widget context menus
+	UIAction::registerAction("Copy Row");
+	UIAction::registerAction("Copy Table");
+	UIAction::registerAction("Column Visibility...");
+	UIAction::registerAction("Reset Columns to Default");
+  UIAction::registerAction("Refresh");
+
 #ifdef WIN32
 	UIAction::registerAction("Record TTD Trace");
 	context->globalActions()->bindAction("Record TTD Trace",
@@ -1017,7 +1172,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				
 				uint64_t startAddr, endAddr;
 				GetAddressRange(ctxt, startAddr, endAddr);
-				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryRead);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, DebuggerTTDMemoryRead);
 			},
 			connectedToTTD));
 	debuggerMenu->addAction("TTD Memory Access\\Read", "TTD");
@@ -1035,7 +1190,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				
 				uint64_t startAddr, endAddr;
 				GetAddressRange(ctxt, startAddr, endAddr);
-				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryWrite);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, DebuggerTTDMemoryWrite);
 			},
 			connectedToTTD));
 	debuggerMenu->addAction("TTD Memory Access\\Write", "TTD");
@@ -1053,7 +1208,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				
 				uint64_t startAddr, endAddr;
 				GetAddressRange(ctxt, startAddr, endAddr);
-				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(BNDebuggerTTDMemoryRead | BNDebuggerTTDMemoryWrite));
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(DebuggerTTDMemoryRead | DebuggerTTDMemoryWrite));
 			},
 			connectedToTTD));
 	debuggerMenu->addAction("TTD Memory Access\\Read/Write", "TTD");
@@ -1071,7 +1226,7 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				
 				uint64_t startAddr, endAddr;
 				GetAddressRange(ctxt, startAddr, endAddr);
-				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, BNDebuggerTTDMemoryExecute);
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, DebuggerTTDMemoryExecute);
 			},
 			connectedToTTD));
 	debuggerMenu->addAction("TTD Memory Access\\Execute", "TTD");
@@ -1089,64 +1244,62 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 				
 				uint64_t startAddr, endAddr;
 				GetAddressRange(ctxt, startAddr, endAddr);
-				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(BNDebuggerTTDMemoryRead | BNDebuggerTTDMemoryWrite | BNDebuggerTTDMemoryExecute));
+				QueryTTDMemoryAccess(ctxt, startAddr, endAddr, static_cast<BNDebuggerTTDMemoryAccessType>(DebuggerTTDMemoryRead | DebuggerTTDMemoryWrite | DebuggerTTDMemoryExecute));
 			},
 			connectedToTTD));
 	debuggerMenu->addAction("TTD Memory Access\\Read/Write/Execute", "TTD");
 
 	// TTD Calls menu actions
-	UIAction::registerAction("TTD Calls\\All Calls");
-	context->globalActions()->bindAction("TTD Calls\\All Calls", UIAction([=](const UIActionContext& ctxt) {
-			auto controller = DebuggerController::GetController(ctxt.binaryView);
-			if (!controller || !controller->IsConnected())
-				return;
-			
-			// Query all calls with wildcard
-			QueryTTDCalls(ctxt, "*!*");
-		},
-		connectedToTTD));
-	debuggerMenu->addAction("TTD Calls\\All Calls", "TTD");
-
 	UIAction::registerAction("TTD Calls\\Kernel32 Calls");
 	context->globalActions()->bindAction("TTD Calls\\Kernel32 Calls", UIAction([=](const UIActionContext& ctxt) {
 			auto controller = DebuggerController::GetController(ctxt.binaryView);
 			if (!controller || !controller->IsConnected())
 				return;
-			
+
 			// Query kernel32 calls
 			QueryTTDCalls(ctxt, "kernel32!*");
 		},
 		connectedToTTD));
 	debuggerMenu->addAction("TTD Calls\\Kernel32 Calls", "TTD");
 
-	UIAction::registerAction("TTD Calls\\Ntdll Calls");
-	context->globalActions()->bindAction("TTD Calls\\Ntdll Calls", UIAction([=](const UIActionContext& ctxt) {
-			auto controller = DebuggerController::GetController(ctxt.binaryView);
-			if (!controller || !controller->IsConnected())
-				return;
-			
-			// Query ntdll calls
-			QueryTTDCalls(ctxt, "ntdll!*");
-		},
-		connectedToTTD));
-	debuggerMenu->addAction("TTD Calls\\Ntdll Calls", "TTD");
+	UIAction::registerAction("Navigate to TTD Timestamp...", QKeySequence(Qt::ShiftModifier | Qt::Key_G));
+	context->globalActions()->bindAction("Navigate to TTD Timestamp...",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
 
-	// TTD Calls context menu action for functions
-	UIAction::registerAction("TTD Calls\\Query Function");
-	context->globalActions()->bindAction("TTD Calls\\Query Function", UIAction([=](const UIActionContext& ctxt) {
-			auto controller = DebuggerController::GetController(ctxt.binaryView);
-			if (!controller || !controller->IsConnected())
-				return;
-			
-			// Get function name from context
-			if (ctxt.function)
-			{
-				auto funcName = ctxt.function->GetSymbol()->GetFullName();
-				QueryTTDCalls(ctxt, funcName);
-			}
-		},
-		connectedToTTD));
-	debuggerMenu->addAction("TTD Calls\\Query Function", "TTD");
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsTTD())
+					return;
+
+				auto dialog = new TimestampNavigationDialog(ctxt.context->mainWindow(), controller);
+				dialog->show();
+				dialog->raise();
+				dialog->activateWindow();
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("Navigate to TTD Timestamp...", "TTD");
+
+	UIAction::registerAction("TTD Analysis...");
+	context->globalActions()->bindAction("TTD Analysis...",
+		UIAction(
+			[=](const UIActionContext& ctxt) {
+				if (!ctxt.binaryView)
+					return;
+
+				auto controller = DebuggerController::GetController(ctxt.binaryView);
+				if (!controller || !controller->IsTTD())
+					return;
+
+				auto dialog = new TTDAnalysisDialog(ctxt.binaryView, nullptr);
+				dialog->show();
+				dialog->raise();
+				dialog->activateWindow();
+			},
+			connectedToTTD));
+	debuggerMenu->addAction("TTD Analysis...", "TTD");
+
 #endif
 }
 
@@ -1154,36 +1307,55 @@ void GlobalDebuggerUI::SetupMenu(UIContext* context)
 #ifdef WIN32
 void GlobalDebuggerUI::installTTD(const UIActionContext& ctxt)
 {
-#ifdef DEMO_EDITION
-	FreeVersionLimitation dialog("installing WinDbg/TTD automatically.\n"
-		"Please refer to the documentation to install it manually:\n"
-		"https://docs.binary.ninja/guide/debugger/dbgeng-ttd.html#install-windbg-manually");
-	dialog.exec();
-#else
-	std::string pluginRoot;
-	if (getenv("BN_STANDALONE_DEBUGGER") != nullptr)
-		pluginRoot = GetUserPluginDirectory();
-	else
-		pluginRoot = GetBundledPluginDirectory();
+	// Create and show progress dialog with actual progress range
+	QProgressDialog* progress = new QProgressDialog("Initializing installation...", nullptr, 0, 100, ctxt.context->mainWindow());
+	progress->setWindowModality(Qt::WindowModal);
+	progress->setMinimumDuration(0);
+	progress->setCancelButton(nullptr); // No cancel button since we can't safely cancel mid-installation
+	progress->show();
+	QCoreApplication::processEvents();
 
-	auto ttdInstallerScript = filesystem::path(pluginRoot) / "dbgeng" / "install_windbg.py";
-	LogDebug("WinDbg/TTD installer script expected at: %s", ttdInstallerScript.string().c_str());
-	if (!std::filesystem::exists(ttdInstallerScript))
-	{
-		LogWarn("WinDbg/TTD installer script does not exist at: %s", ttdInstallerScript.string().c_str());
-		return;
-	}
+	// Use QTimer to run installation asynchronously
+	QTimer::singleShot(100, [progress]() {
+		bool success = false;
+		try 
+		{
+			// Create progress callback to update the dialog
+			auto progressCallback = [progress](const std::string& step, int progressPercent) {
+				QMetaObject::invokeMethod(progress, [progress, step, progressPercent]() {
+					progress->setLabelText(QString::fromStdString(step));
+					if (progressPercent >= 0 && progressPercent <= 100)
+					{
+						progress->setValue(progressPercent);
+					}
+					QCoreApplication::processEvents();
+				}, Qt::QueuedConnection);
+			};
 
-	auto sidebar = ctxt.context->sidebar();
-	if (!sidebar)
-		return;
+			success = BinaryNinjaDebugger::InstallWinDbg(progressCallback);
+		}
+		catch (...)
+		{
+			success = false;
+		}
 
-	auto *widget = qobject_cast<ScriptingConsole*>(sidebar->widget("Console"));
-	if (!widget)
-		return;
-
-	widget->runScriptFromFile(ttdInstallerScript.string());
-#endif
+		progress->close();
+		progress->deleteLater();
+		
+		if (success)
+		{
+			QMessageBox::information(nullptr, "Installation Complete", 
+				"WinDbg/TTD has been successfully installed!\n\n"
+				"Please restart Binary Ninja to make the changes take effect.");
+		}
+		else
+		{
+			QMessageBox::warning(nullptr, "Installation Failed",
+				"Failed to install WinDbg/TTD. Please check the log for details.\n\n"
+				"You can also install WinDbg manually by following the documentation:\n"
+				"https://docs.binary.ninja/guide/debugger/dbgeng-ttd.html#install-windbg-manually");
+		}
+	});
 }
 #endif
 
@@ -1537,70 +1709,14 @@ void DebuggerUI::updateUI(const DebuggerEvent& event)
 	}
 
 	case RelativeBreakpointAddedEvent:
-	{
-		uint64_t address = m_controller->RelativeAddressToAbsolute(event.data.relativeAddress);
-
-		std::vector<std::pair<BinaryViewRef, uint64_t>> dataAndAddress;
-		if (m_controller->GetData())
-			dataAndAddress.emplace_back(m_controller->GetData(), address);
-
-		if (DebugModule::IsSameBaseModule(event.data.relativeAddress.module, m_controller->GetInputFile()))
-		{
-			dataAndAddress.emplace_back(m_controller->GetData(), m_controller->GetViewFileSegmentsStart() + event.data.relativeAddress.offset);
-		}
-
-		m_context->refreshCurrentViewContents();
-		break;
-	}
 	case AbsoluteBreakpointAddedEvent:
-	{
-		uint64_t address = event.data.absoluteAddress;
-
-		std::vector<std::pair<BinaryViewRef, uint64_t>> dataAndAddress;
-		BinaryViewRef data = m_controller->GetData();
-		if (data)
-			dataAndAddress.emplace_back(data, address);
-
-		ModuleNameAndOffset relative = m_controller->AbsoluteAddressToRelative(address);
-		if (DebugModule::IsSameBaseModule(relative.module, m_controller->GetInputFile()))
-		{
-			dataAndAddress.emplace_back(m_controller->GetData(), m_controller->GetViewFileSegmentsStart() + relative.offset);
-		}
-
-		m_context->refreshCurrentViewContents();
-		break;
-	}
 	case RelativeBreakpointRemovedEvent:
-	{
-		uint64_t address = m_controller->RelativeAddressToAbsolute(event.data.relativeAddress);
-
-		std::vector<std::pair<BinaryViewRef, uint64_t>> dataAndAddress;
-		if (m_controller->GetData())
-			dataAndAddress.emplace_back(m_controller->GetData(), address);
-
-		if (DebugModule::IsSameBaseModule(event.data.relativeAddress.module, m_controller->GetInputFile()))
-		{
-			dataAndAddress.emplace_back(m_controller->GetData(), m_controller->GetViewFileSegmentsStart() + event.data.relativeAddress.offset);
-		}
-
-		m_context->refreshCurrentViewContents();
-		break;
-	}
 	case AbsoluteBreakpointRemovedEvent:
+	case RelativeBreakpointEnabledEvent:
+	case AbsoluteBreakpointEnabledEvent:
+	case RelativeBreakpointDisabledEvent:
+	case AbsoluteBreakpointDisabledEvent:
 	{
-		uint64_t address = event.data.absoluteAddress;
-
-		std::vector<std::pair<BinaryViewRef, uint64_t>> dataAndAddress;
-		BinaryViewRef data = m_controller->GetData();
-		if (data)
-			dataAndAddress.emplace_back(data, address);
-
-		ModuleNameAndOffset relative = m_controller->AbsoluteAddressToRelative(address);
-		if (DebugModule::IsSameBaseModule(relative.module, m_controller->GetInputFile()))
-		{
-			dataAndAddress.emplace_back(m_controller->GetData(), m_controller->GetViewFileSegmentsStart() + relative.offset);
-		}
-
 		m_context->refreshCurrentViewContents();
 		break;
 	}
@@ -1629,6 +1745,7 @@ void GlobalDebuggerUI::InitializeUI()
 	Sidebar::addSidebarWidgetType(new DebugInfoWidgetType());
 	Sidebar::addSidebarWidgetType(new TTDMemoryWidgetType());
 	Sidebar::addSidebarWidgetType(new TTDCallsWidgetType());
+	Sidebar::addSidebarWidgetType(new TTDEventsWidgetType());
 }
 
 

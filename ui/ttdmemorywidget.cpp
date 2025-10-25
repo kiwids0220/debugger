@@ -119,6 +119,7 @@ TTDMemoryQueryWidget::TTDMemoryQueryWidget(QWidget* parent, BinaryViewRef data)
 	                   << true; // IP
 	
 	setupUI();
+	setupUIActions();
 }
 
 TTDMemoryQueryWidget::~TTDMemoryQueryWidget()
@@ -127,7 +128,8 @@ TTDMemoryQueryWidget::~TTDMemoryQueryWidget()
 
 void TTDMemoryQueryWidget::setupUI()
 {
-	setMinimumSize(800, 600);
+	// Set size policy to allow widget to adapt to sidebar space and prevent scroll bar clipping
+	setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	
 	QVBoxLayout* mainLayout = new QVBoxLayout(this);
 	
@@ -197,6 +199,10 @@ void TTDMemoryQueryWidget::setupUI()
 	
 	inputLayout->addRow("", buttonLayout);
 	
+	// Connect Enter key press in line edits to perform query
+	connect(m_startAddressEdit, &QLineEdit::returnPressed, this, &TTDMemoryQueryWidget::performQuery);
+	connect(m_endAddressEdit, &QLineEdit::returnPressed, this, &TTDMemoryQueryWidget::performQuery);
+	
 	// Set the input widget as the content of the expandable group
 	ExpandableGroup* expandableGroup = new ExpandableGroup(inputLayout, "Query Parameters", this, true);
 	
@@ -208,38 +214,15 @@ void TTDMemoryQueryWidget::setupUI()
 	
 	// Status label
 	m_statusLabel = new QLabel("Ready");
-	m_statusLabel->setStyleSheet("QLabel { color: #666; font-size: 12px; }");
+	m_statusLabel->setStyleSheet("QLabel { font-size: 12px; }");
 	mainLayout->addWidget(m_statusLabel);
 	
 	setLayout(mainLayout);
 	
-	// Update UI state based on controller
-	bool canQuery = false;
-	if (m_controller)
-	{
-		canQuery = m_controller->IsTTD();
-	}
-	
-	m_queryButton->setEnabled(canQuery);
-	
-	if (!canQuery)
-	{
-		if (!m_controller)
-		{
-			updateStatus("No debugger controller available");
-			m_queryButton->setToolTip("Query Memory Events - No debugger controller available");
-		}
-		else if (!m_controller->IsTTD())
-		{
-			updateStatus("TTD (Time Travel Debugging) not available with current target");
-			m_queryButton->setToolTip("Query Memory Events - TTD (Time Travel Debugging) not available with current adapter");
-		}
-	}
-	else
-	{
-		updateStatus("Ready - TTD memory analysis available");
-		m_queryButton->setToolTip("Execute TTD memory analysis query");
-	}
+	// Button is always enabled - errors are shown in performQuery() if needed
+	m_queryButton->setEnabled(true);
+	m_queryButton->setToolTip("Execute TTD memory analysis query");
+	updateStatus("Ready");
 }
 
 void TTDMemoryQueryWidget::setupTable()
@@ -247,6 +230,9 @@ void TTDMemoryQueryWidget::setupTable()
 	m_resultsTable = new QTableWidget();
 	m_resultsTable->setColumnCount(m_columnNames.size());
 	m_resultsTable->setHorizontalHeaderLabels(m_columnNames);
+	
+	// Set size policy to ensure table scrollbar works correctly within sidebar constraints
+	m_resultsTable->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	
 	// Configure table appearance
 	m_resultsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -277,10 +263,6 @@ void TTDMemoryQueryWidget::setupTable()
 	connect(m_resultsTable, &QTableWidget::cellDoubleClicked, 
 			this, &TTDMemoryQueryWidget::onCellDoubleClicked);
 	
-	// Add Ctrl+C shortcut for copying current cell
-	QShortcut* copyShortcut = new QShortcut(QKeySequence::Copy, m_resultsTable);
-	connect(copyShortcut, &QShortcut::activated, this, &TTDMemoryQueryWidget::copySelectedCell);
-	
 	// Setup context menu
 	setupContextMenu();
 }
@@ -290,6 +272,29 @@ void TTDMemoryQueryWidget::setupContextMenu()
 	m_resultsTable->setContextMenuPolicy(Qt::CustomContextMenu);
 	connect(m_resultsTable, &QTableWidget::customContextMenuRequested,
 			this, &TTDMemoryQueryWidget::showContextMenu);
+}
+
+void TTDMemoryQueryWidget::setupUIActions()
+{
+	m_actionHandler.setupActionHandler(this);
+	m_contextMenuManager = new ContextMenuManager(this);
+	m_menu = new Menu();
+
+	// Add Copy action with Ctrl+C support
+	m_menu->addAction("Copy", "Options", MENU_ORDER_NORMAL);
+	m_actionHandler.bindAction("Copy", UIAction([&]() { copy(); }, [&]() { return canCopy(); }));
+	
+	m_menu->addAction("Copy Row", "Options", MENU_ORDER_NORMAL);
+	m_actionHandler.bindAction("Copy Row", UIAction([&]() { copySelectedRow(); }, [&]() { return canCopy(); }));
+	
+	m_menu->addAction("Copy Table", "Options", MENU_ORDER_NORMAL);
+	m_actionHandler.bindAction("Copy Table", UIAction([&]() { copyEntireTable(); }, [&]() { return m_resultsTable->rowCount() > 0; }));
+
+	m_menu->addAction("Column Visibility...", "Options", MENU_ORDER_NORMAL);
+	m_actionHandler.bindAction("Column Visibility...", UIAction([&]() { showColumnVisibilityDialog(); }));
+	
+	m_menu->addAction("Reset Columns to Default", "Options", MENU_ORDER_NORMAL);
+	m_actionHandler.bindAction("Reset Columns to Default", UIAction([&]() { resetColumnsToDefault(); }));
 }
 
 void TTDMemoryQueryWidget::updateColumnVisibility()
@@ -509,30 +514,24 @@ void TTDMemoryQueryWidget::showColumnVisibilityDialog()
 	}
 }
 
+void TTDMemoryQueryWidget::contextMenuEvent(QContextMenuEvent* event)
+{
+	showContextMenu(event->pos());
+}
+
 void TTDMemoryQueryWidget::showContextMenu(const QPoint& position)
 {
-	QMenu menu(this);
-	
-	QAction* copyCellAction = menu.addAction("Copy Cell");
-	QAction* copyRowAction = menu.addAction("Copy Row");
-	QAction* copyTableAction = menu.addAction("Copy Table");
-	menu.addSeparator();
-	QAction* columnsAction = menu.addAction("Columns...");
-	QAction* resetColumnsAction = menu.addAction("Reset Columns to Default");
-	
-	connect(copyCellAction, &QAction::triggered, this, &TTDMemoryQueryWidget::copySelectedCell);
-	connect(copyRowAction, &QAction::triggered, this, &TTDMemoryQueryWidget::copySelectedRow);
-	connect(copyTableAction, &QAction::triggered, this, &TTDMemoryQueryWidget::copyEntireTable);
-	connect(columnsAction, &QAction::triggered, this, &TTDMemoryQueryWidget::showColumnVisibilityDialog);
-	connect(resetColumnsAction, &QAction::triggered, this, &TTDMemoryQueryWidget::resetColumnsToDefault);
-	
-	// Enable/disable actions based on selection
-	QTableWidgetItem* item = m_resultsTable->itemAt(position);
-	copyCellAction->setEnabled(item != nullptr);
-	copyRowAction->setEnabled(item != nullptr);
-	copyTableAction->setEnabled(m_resultsTable->rowCount() > 0);
-	
-	menu.exec(m_resultsTable->mapToGlobal(position));
+	m_contextMenuManager->show(m_menu, &m_actionHandler);
+}
+
+bool TTDMemoryQueryWidget::canCopy()
+{
+	return m_resultsTable->currentItem() != nullptr;
+}
+
+void TTDMemoryQueryWidget::copy()
+{
+	copySelectedCell();
 }
 
 void TTDMemoryQueryWidget::copySelectedCell()
@@ -667,6 +666,36 @@ void TTDMemoryQueryWidget::setParametersAndQuery(uint64_t startAddr, uint64_t en
 	performQuery();
 }
 
+void TTDMemoryQueryWidget::setParameters(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType)
+{
+	// Set address fields
+	m_startAddressEdit->setText(QString("0x%1").arg(startAddr, 0, 16));
+	m_endAddressEdit->setText(QString("0x%1").arg(endAddr, 0, 16));
+	
+	// Set access type checkboxes
+	m_readAccessCheck->setChecked(accessType & TTDMemoryRead);
+	m_writeAccessCheck->setChecked(accessType & TTDMemoryWrite);
+	m_executeAccessCheck->setChecked(accessType & TTDMemoryExecute);
+	
+	// Don't trigger the query
+}
+
+void TTDMemoryQueryWidget::setParameters(const QString& startAddr, const QString& endAddr, TTDMemoryAccessType accessType)
+{
+	// Set address fields as strings
+	if (!startAddr.isEmpty())
+		m_startAddressEdit->setText(startAddr);
+	if (!endAddr.isEmpty())
+		m_endAddressEdit->setText(endAddr);
+	
+	// Set access type checkboxes
+	m_readAccessCheck->setChecked(accessType & TTDMemoryRead);
+	m_writeAccessCheck->setChecked(accessType & TTDMemoryWrite);
+	m_executeAccessCheck->setChecked(accessType & TTDMemoryExecute);
+	
+	// Don't trigger the query
+}
+
 bool TTDMemoryQueryWidget::isUnused() const
 {
 	// Consider a tab unused if it has no results
@@ -688,7 +717,8 @@ TTDMemoryWidget::~TTDMemoryWidget()
 void TTDMemoryWidget::setupUI()
 {
 	setWindowTitle("TTD Memory Analysis");
-	setMinimumSize(900, 700);
+	// Set size policy to allow widget to adapt to sidebar space and prevent scroll bar clipping
+	setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	
 	QVBoxLayout* mainLayout = new QVBoxLayout(this);
 	mainLayout->setContentsMargins(0, 0, 0, 0);
@@ -716,9 +746,28 @@ void TTDMemoryWidget::setupUI()
 
 void TTDMemoryWidget::createNewTab()
 {
+	// Get parameters from current tab if exists
+	TTDMemoryQueryWidget* currentWidget = qobject_cast<TTDMemoryQueryWidget*>(m_tabWidget->currentWidget());
+	QString startAddr, endAddr;
+	TTDMemoryAccessType accessType = static_cast<TTDMemoryAccessType>(0);
+	
+	if (currentWidget)
+	{
+		startAddr = currentWidget->getStartAddress();
+		endAddr = currentWidget->getEndAddress();
+		accessType = currentWidget->getCurrentAccessType();
+	}
+	
+	// Create new tab
 	TTDMemoryQueryWidget* queryWidget = new TTDMemoryQueryWidget(this, m_data);
 	int tabIndex = m_tabWidget->addTab(queryWidget, QString("Query %1").arg(m_tabWidget->count() + 1));
 	m_tabWidget->setCurrentIndex(tabIndex);
+	
+	// Set parameters from previous tab if any existed
+	if (currentWidget && (!startAddr.isEmpty() || !endAddr.isEmpty() || accessType != 0))
+	{
+		queryWidget->setParameters(startAddr, endAddr, accessType);
+	}
 }
 
 void TTDMemoryWidget::closeTab(int index)

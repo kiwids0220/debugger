@@ -19,6 +19,7 @@ limitations under the License.
 #include "binaryninjaapi.h"
 #include "ffi.h"
 #include "../vendor/intx/intx.hpp"
+#include <optional>
 
 using namespace BinaryNinja;
 
@@ -464,15 +465,15 @@ namespace BinaryNinjaDebuggerAPI {
 	{
 		uint64_t sequence;
 		uint64_t step;
-		
+
 		TTDPosition() : sequence(0), step(0) {}
 		TTDPosition(uint64_t seq, uint64_t st) : sequence(seq), step(st) {}
-		
+
 		bool operator==(const TTDPosition& other) const
 		{
 			return sequence == other.sequence && step == other.step;
 		}
-		
+
 		bool operator<(const TTDPosition& other) const
 		{
 			if (sequence < other.sequence)
@@ -496,7 +497,7 @@ namespace BinaryNinjaDebuggerAPI {
 		uint64_t memoryAddress;        // Memory address (may be same as address)
 		uint64_t instructionAddress;   // IP - Address of instruction that caused the access
 		uint64_t value;                // Value that was read/written/executed
-		
+
 		TTDMemoryEvent() : threadId(0), uniqueThreadId(0), accessType(TTDMemoryRead), address(0), size(0), memoryAddress(0), instructionAddress(0), value(0) {}
 	};
 
@@ -513,8 +514,80 @@ namespace BinaryNinjaDebuggerAPI {
 		std::vector<std::string> parameters; // Array containing parameters passed to the function
 		TTDPosition timeStart;         // Position when call started
 		TTDPosition timeEnd;           // Position when call ended
-		
+
 		TTDCallEvent() : threadId(0), uniqueThreadId(0), functionAddress(0), returnAddress(0), returnValue(0), hasReturnValue(false) {}
+	};
+
+	// TTD Event Types - bitfield flags for filtering events
+	enum TTDEventType
+	{
+		TTDEventNone = 0,
+		TTDEventThreadCreated = 1,
+		TTDEventThreadTerminated = 2,
+		TTDEventModuleLoaded = 4,
+		TTDEventModuleUnloaded = 8,
+		TTDEventException = 16,
+		TTDEventAll = TTDEventThreadCreated | TTDEventThreadTerminated | TTDEventModuleLoaded | TTDEventModuleUnloaded | TTDEventException
+	};
+
+	// TTD Module - information about modules that were loaded/unloaded during trace
+	struct TTDModule
+	{
+		std::string name;              // Name and path of the module
+		uint64_t address;              // Address where the module was loaded
+		uint64_t size;                 // Size of the module in bytes
+		uint32_t checksum;             // Checksum of the module
+		uint32_t timestamp;            // Timestamp of the module
+		
+		TTDModule() : address(0), size(0), checksum(0), timestamp(0) {}
+	};
+
+	// TTD Thread - information about threads and their lifetime during trace
+	struct TTDThread
+	{
+		uint32_t uniqueId;             // Unique ID for the thread across the trace
+		uint32_t id;                   // TID of the thread
+		TTDPosition lifetimeStart;     // Lifetime start position
+		TTDPosition lifetimeEnd;       // Lifetime end position
+		TTDPosition activeTimeStart;   // Active time start position
+		TTDPosition activeTimeEnd;     // Active time end position
+		
+		TTDThread() : uniqueId(0), id(0) {}
+	};
+
+	// TTD Exception Types
+	enum TTDExceptionType
+	{
+		TTDExceptionSoftware,
+		TTDExceptionHardware
+	};
+
+	// TTD Exception - information about exceptions that occurred during trace
+	struct TTDException
+	{
+		TTDExceptionType type;         // Type of exception (Software/Hardware)
+		uint64_t programCounter;       // Instruction where exception was thrown
+		uint32_t code;                 // Exception code
+		uint32_t flags;                // Exception flags
+		uint64_t recordAddress;        // Where in memory the exception record is found
+		TTDPosition position;          // Position where exception occurred
+		
+		TTDException() : type(TTDExceptionSoftware), programCounter(0), code(0), flags(0), recordAddress(0) {}
+	};
+
+	// TTD Event - represents important events that happened during trace
+	struct TTDEvent
+	{
+		TTDEventType type;             // Type of event
+		TTDPosition position;          // Position where event occurred
+		
+		// Optional child objects - existence depends on event type
+		std::optional<TTDModule> module;      // For ModuleLoaded/ModuleUnloaded events
+		std::optional<TTDThread> thread;      // For ThreadCreated/ThreadTerminated events
+		std::optional<TTDException> exception; // For Exception events
+		
+		TTDEvent() : type(TTDEventThreadCreated) {}
+		TTDEvent(TTDEventType eventType) : type(eventType) {}
 	};
 
 
@@ -554,6 +627,8 @@ namespace BinaryNinjaDebuggerAPI {
 		bool WriteMemory(std::uintptr_t address, const DataBuffer& buffer);
 
 		std::vector<DebugProcess> GetProcessList();
+
+		std::uint32_t GetActivePID();
 
 		std::vector<DebugThread> GetThreads();
 		DebugThread GetActiveThread();
@@ -596,6 +671,8 @@ namespace BinaryNinjaDebuggerAPI {
 
 		bool RunTo(uint64_t remoteAddresses);
 		bool RunTo(const std::vector<uint64_t>& remoteAddresses);
+		bool RunToReverse(uint64_t remoteAddresses);
+		bool RunToReverse(const std::vector<uint64_t>& remoteAddresses);
 		void Pause();
 
 		DebugStopReason GoAndWait();
@@ -608,6 +685,8 @@ namespace BinaryNinjaDebuggerAPI {
 		DebugStopReason StepReturnReverseAndWait();
 		DebugStopReason RunToAndWait(uint64_t remoteAddresses);
 		DebugStopReason RunToAndWait(const std::vector<uint64_t>& remoteAddresses);
+		DebugStopReason RunToReverseAndWait(uint64_t remoteAddresses);
+		DebugStopReason RunToReverseAndWait(const std::vector<uint64_t>& remoteAddresses);
 		DebugStopReason PauseAndWait();
 		DebugStopReason RestartAndWait();
 
@@ -640,6 +719,10 @@ namespace BinaryNinjaDebuggerAPI {
 		void DeleteBreakpoint(const ModuleNameAndOffset& breakpoint);
 		void AddBreakpoint(uint64_t address);
 		void AddBreakpoint(const ModuleNameAndOffset& breakpoint);
+		void EnableBreakpoint(uint64_t address);
+		void EnableBreakpoint(const ModuleNameAndOffset& breakpoint);
+		void DisableBreakpoint(uint64_t address);
+		void DisableBreakpoint(const ModuleNameAndOffset& breakpoint);
 		bool ContainsBreakpoint(uint64_t address);
 		bool ContainsBreakpoint(const ModuleNameAndOffset& breakpoint);
 
@@ -683,8 +766,17 @@ namespace BinaryNinjaDebuggerAPI {
 		// TTD Memory Analysis Methods
 		std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t address, uint64_t size, TTDMemoryAccessType accessType = TTDMemoryRead);
 		std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0);
+		std::vector<TTDEvent> GetTTDEvents(TTDEventType eventType);
+		std::vector<TTDEvent> GetAllTTDEvents();
 		TTDPosition GetCurrentTTDPosition();
 		bool SetTTDPosition(const TTDPosition& position);
+
+		// TTD Code Coverage Analysis Methods
+		bool IsInstructionExecuted(uint64_t address);
+		bool RunCodeCoverageAnalysis(uint64_t startAddress, uint64_t endAddress);
+		size_t GetExecutedInstructionCount() const;
+		bool SaveCodeCoverageToFile(const std::string& filePath) const;
+		bool LoadCodeCoverageFromFile(const std::string& filePath);
 
 		void PostDebuggerEvent(const DebuggerEvent& event);
 

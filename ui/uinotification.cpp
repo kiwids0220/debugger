@@ -176,6 +176,8 @@ void NotificationListener::OnContextMenuCreated(UIContext *context, View* view, 
 		return;
 
 	menu.addAction("Debugger", "Toggle Breakpoint", "Breakpoint");
+	menu.addAction("Debugger", "Enable Breakpoint", "Breakpoint");
+	menu.addAction("Debugger", "Solo Breakpoint", "Breakpoint");
 	menu.addAction("Debugger", "Launch", "Control");
 	menu.addAction("Debugger", "Pause", "Control");
 	menu.addAction("Debugger", "Restart", "Control");
@@ -184,16 +186,18 @@ void NotificationListener::OnContextMenuCreated(UIContext *context, View* view, 
 	menu.addAction("Debugger", "Step Over", "Control");
 	menu.addAction("Debugger", "Step Return", "Control");
 	menu.addAction("Debugger", "Run To Here", "Control");
+	menu.addAction("Debugger", "Run Back To Here", "Control");
 	menu.addAction("Debugger", "Create Stack View", "Misc");
 	menu.addAction("Debugger", "Override IP", "Misc");
 #ifdef WIN32
 	// TTD Memory Access context menu items
+	menu.addAction("Debugger", "Navigate to TTD Timestamp...", "TTD");
 	menu.addAction("Debugger", "TTD Memory Access\\Read", "TTD");
 	menu.addAction("Debugger", "TTD Memory Access\\Write", "TTD");
 	menu.addAction("Debugger", "TTD Memory Access\\Read/Write", "TTD");
 	menu.addAction("Debugger", "TTD Memory Access\\Execute", "TTD");
 	menu.addAction("Debugger", "TTD Memory Access\\Read/Write/Execute", "TTD");
 	// TTD Calls context menu item
-	menu.addAction("Debugger", "TTD Calls\\Query Function", "TTD");
+	menu.addAction("Debugger", "TTD Calls\\Kernel32 Calls", "TTD");
 #endif
 }

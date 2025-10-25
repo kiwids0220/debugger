@@ -238,6 +238,8 @@ namespace BinaryNinjaDebugger {
 
 		virtual std::vector<DebugProcess> GetProcessList() = 0;
 
+		virtual std::uint32_t GetActivePID() = 0;
+
 		virtual std::vector<DebugThread> GetThreadList() = 0;
 
 		virtual DebugThread GetActiveThread() const = 0;
@@ -261,6 +263,14 @@ namespace BinaryNinjaDebugger {
 		virtual bool RemoveBreakpoint(const DebugBreakpoint& breakpoint) = 0;
 
 		virtual bool RemoveBreakpoint(const ModuleNameAndOffset& address) { return false; }
+
+		virtual bool EnableBreakpoint(const std::uintptr_t address) { return false; }
+
+		virtual bool EnableBreakpoint(const ModuleNameAndOffset& address) { return false; }
+
+		virtual bool DisableBreakpoint(const std::uintptr_t address) { return false; }
+
+		virtual bool DisableBreakpoint(const ModuleNameAndOffset& address) { return false; }
 
 		virtual std::vector<DebugBreakpoint> GetBreakpointList() const = 0;
 
@@ -330,6 +340,8 @@ namespace BinaryNinjaDebugger {
 		// TTD (Time Travel Debugging) methods - default implementations return empty results
 		virtual std::vector<TTDMemoryEvent> GetTTDMemoryAccessForAddress(uint64_t startAddress, uint64_t endAddress, TTDMemoryAccessType accessType = TTDMemoryRead);
 		virtual std::vector<TTDCallEvent> GetTTDCallsForSymbols(const std::string& symbols, uint64_t startReturnAddress = 0, uint64_t endReturnAddress = 0);
+		virtual std::vector<TTDEvent> GetTTDEvents(TTDEventType eventType);
+		virtual std::vector<TTDEvent> GetAllTTDEvents();
 		virtual TTDPosition GetCurrentTTDPosition();
 		virtual bool SetTTDPosition(const TTDPosition& position);
 

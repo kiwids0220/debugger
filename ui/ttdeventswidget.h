@@ -38,6 +38,7 @@ limitations under the License.
 #include <QPropertyAnimation>
 #include <QParallelAnimationGroup>
 #include <QContextMenuEvent>
+#include <QComboBox>
 #include "inttypes.h"
 #include "binaryninjaapi.h"
 #include "debuggerapi.h"
@@ -46,52 +47,62 @@ limitations under the License.
 #include "debuggeruicommon.h"
 #include "menus.h"
 #include "uitypes.h"
+#include <vector>
 
 using namespace BinaryNinja;
 using namespace BinaryNinjaDebuggerAPI;
 
-class ColumnVisibilityDialog : public QDialog
+class TTDEventsColumnVisibilityDialog : public QDialog
 {
 	Q_OBJECT
 
 public:
-	ColumnVisibilityDialog(QWidget* parent, const QStringList& columnNames, const QList<bool>& visibility);
+	TTDEventsColumnVisibilityDialog(QWidget* parent, const QStringList& columnNames, const QList<bool>& visibility);
 	QList<bool> getColumnVisibility() const;
 
 private:
 	QListWidget* m_columnList;
 };
 
-class TTDMemoryQueryWidget : public QWidget
+class TTDEventsQueryWidget : public QWidget
 {
 	Q_OBJECT
 
 public:
+	// Enum for widget specialization
+	enum WidgetType {
+		AllEvents,     // Shows all events with filtering checkboxes
+		ModuleEvents,  // Shows only module events with relevant columns
+		ThreadEvents,  // Shows only thread events with relevant columns  
+		ExceptionEvents // Shows only exception events with relevant columns
+	};
+
 	// Enum for logical column identification
 	enum LogicalColumn {
 		IndexColumn = 0,
 		EventTypeColumn,
-		TimeStartColumn,
-		TimeEndColumn,
-		AccessTypeColumn,
-		AddressColumn,
-		SizeColumn,
-		ValueColumn,
+		PositionColumn,
 		ThreadIdColumn,
-		UniqueThreadIdColumn,
-		IPColumn
+		ThreadUniqueIdColumn,
+		ModuleNameColumn,
+		ModuleAddressColumn,
+		ModuleSizeColumn,
+		ExceptionTypeColumn,
+		ExceptionCodeColumn,
+		ExceptionPCColumn
 	};
 
 private:
 	BinaryViewRef m_data;
 	DbgRef<DebuggerController> m_controller;
+	WidgetType m_widgetType;  // Determines specialization mode
 	
-	// Input controls
-	QLineEdit* m_startAddressEdit;
-	QLineEdit* m_endAddressEdit;
-	QCheckBox* m_readAccessCheck;
-	QCheckBox* m_writeAccessCheck;
-	QCheckBox* m_executeAccessCheck;
+	// Input controls - checkboxes for filtering
+	QCheckBox* m_threadCreatedCheck;
+	QCheckBox* m_threadTerminatedCheck;
+	QCheckBox* m_moduleLoadedCheck;
+	QCheckBox* m_moduleUnloadedCheck;
+	QCheckBox* m_exceptionCheck;
 	QPushButton* m_queryButton;
 	QPushButton* m_clearButton;
 	
@@ -110,40 +121,36 @@ private:
 	ContextMenuManager* m_contextMenuManager;
 	Menu* m_menu;
 	
+	// All events cache
+	std::vector<TTDEvent> m_allEvents;
+	
 	void setupUI();
 	void setupTable();
 	void updateStatus(const QString& message);
-	uint64_t parseAddress(const QString& text);
-	TTDMemoryAccessType getSelectedAccessTypes();
 	void setupContextMenu();
 	void setupUIActions();
 	void updateColumnVisibility();
 	bool canCopy();
+	void filterAndDisplayEvents();
+	void filterAndDisplaySpecializedEvents(); // For specialized widget types
 	
 	virtual void contextMenuEvent(QContextMenuEvent* event) override;
 	
 public:
-	TTDMemoryQueryWidget(QWidget* parent, BinaryViewRef data);
-	virtual ~TTDMemoryQueryWidget();
+	TTDEventsQueryWidget(QWidget* parent, BinaryViewRef data, WidgetType type = AllEvents);
+	virtual ~TTDEventsQueryWidget();
 	
-	// Method to set parameters and execute query from context menu
-	void setParametersAndQuery(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
+	// Method to execute query and show all events
+	void performInitialQuery();
 	
-	// Method to set parameters without executing query (for duplicating tabs)
-	void setParameters(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
-	void setParameters(const QString& startAddr, const QString& endAddr, TTDMemoryAccessType accessType);
-	
-	// Method to check if this tab is unused (no results and default parameters)
+	// Method to check if this tab is unused (no results)
 	bool isUnused() const;
-	
-	// Methods to get current query parameters for duplication
-	QString getStartAddress() const { return m_startAddressEdit->text(); }
-	QString getEndAddress() const { return m_endAddressEdit->text(); }
-	TTDMemoryAccessType getCurrentAccessType() const { return const_cast<TTDMemoryQueryWidget*>(this)->getSelectedAccessTypes(); }
+
+public Q_SLOTS:
+	void clearResults();
 
 private Q_SLOTS:
 	void performQuery();
-	void clearResults();
 	void onCellDoubleClicked(int row, int column);
 	void showColumnVisibilityDialog();
 	void resetColumnsToDefault();
@@ -152,9 +159,11 @@ private Q_SLOTS:
 	void copySelectedCell();
 	void copySelectedRow();
 	void copyEntireTable();
+	void onFilterChanged();
+	void refreshEvents();  // Clear and re-query events from backend
 };
 
-class TTDMemoryWidget : public QWidget
+class TTDEventsWidget : public QWidget
 {
 	Q_OBJECT
 
@@ -163,61 +172,58 @@ private:
 	DbgRef<DebuggerController> m_controller;
 	QTabWidget* m_tabWidget;
 	QToolButton* m_newTabButton;
+	TTDEventsQueryWidget *m_moduleEventsWidget, *m_threadEventsWidget, *m_exceptionEventsWidget;
+	bool m_isPopulated;
 	
 	void setupUI();
+	void loadAllEvents();
 
 public:
-	TTDMemoryWidget(QWidget* parent, BinaryViewRef data);
-	virtual ~TTDMemoryWidget();
+	TTDEventsWidget(QWidget* parent, BinaryViewRef data);
+	virtual ~TTDEventsWidget();
 	
 	// Method to get current query widget or create new tab
-	TTDMemoryQueryWidget* getCurrentOrNewQueryWidget();
-	void setParametersAndQuery(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
-	void setParametersAndQueryInNewTab(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
+	TTDEventsQueryWidget* getCurrentOrNewQueryWidget();
+	
+	// Methods for event handling
+	void refreshAllTabs();
+	void clearAllTabs();
 
-private Q_SLOTS:
+private slots:
 	void createNewTab();
 	void closeTab(int index);
 };
 
 
-class TTDMemorySidebarWidget : public SidebarWidget
+class TTDEventsSidebarWidget : public SidebarWidget
 {
 	Q_OBJECT
 
 private:
-	TTDMemoryWidget* m_memoryWidget;
+	TTDEventsWidget* m_eventsWidget;
 	BinaryViewRef m_data;
 	DbgRef<DebuggerController> m_controller;
+	size_t m_debuggerEventCallback;
 
 public:
-	TTDMemorySidebarWidget(BinaryViewRef data);
-	~TTDMemorySidebarWidget();
-	
-	// Method to access the TTD Memory widget for context menu actions
-	void setParametersAndQuery(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
-	void setParametersAndQueryInNewTab(uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
+	TTDEventsSidebarWidget(BinaryViewRef data);
+	~TTDEventsSidebarWidget();
+
+signals:
+	void debuggerEvent(const DebuggerEvent& event);
+
+private slots:
+	void onDebuggerEvent(const DebuggerEvent& event);
 };
 
 
-class TTDMemoryWidgetType : public SidebarWidgetType
+class TTDEventsWidgetType : public SidebarWidgetType
 {
-private:
-	struct PendingQuery {
-		uint64_t startAddr;
-		uint64_t endAddr;
-		TTDMemoryAccessType accessType;
-	};
-	static std::map<std::pair<ViewFrame*, BinaryViewRef>, PendingQuery> s_pendingQueries;
-
 public:
-	TTDMemoryWidgetType();
+	TTDEventsWidgetType();
 	SidebarWidget* createWidget(ViewFrame* frame, BinaryViewRef data) override;
 	SidebarWidgetLocation defaultLocation() const override { return SidebarWidgetLocation::RightContent; }
 	SidebarContextSensitivity contextSensitivity() const override { return PerViewTypeSidebarContext; }
 	SidebarIconVisibility defaultIconVisibility() const override { return HideSidebarIconIfNoContent; }
 	SidebarContentClassifier* contentClassifier(ViewFrame*, BinaryViewRef) override;
-	
-	// Static method to set pending query parameters
-	static void SetPendingQuery(ViewFrame* frame, BinaryViewRef data, uint64_t startAddr, uint64_t endAddr, TTDMemoryAccessType accessType);
 };
